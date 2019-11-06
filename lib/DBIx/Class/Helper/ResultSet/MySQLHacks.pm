@@ -107,6 +107,14 @@ sub multi_table_update {
     ### $from_where_sql =~ s/^\(\s*(.+)\s*\)$/$1/s;
     ### $from_where_sql =~ s/SELECT COUNT[()*\s]+(?= FROM)//;
 
+    # Collect attrs for various calls
+    my $resolved_attrs = { %{$self->_resolved_attrs} };
+
+    # Use the resolved SELECT args here, since prune_unused_joins may be turned on, and
+    # we don't want that overtrimming the FROM/WHERE lists.
+    my $select_args = delete $resolved_attrs->{select} // ['*'];
+    push @$select_args, keys %$values;
+
     # Get the SQL/binds for the SET part
     my ($set_sql, $set_bind);
     ($set_sql, @$set_bind) = $sql_maker->update('DUAL', $values);  # no WHERE
@@ -115,9 +123,8 @@ sub multi_table_update {
     $set_bind = $storage->_resolve_bindattrs( $rsrc, $set_bind, $rsrc->columns_info );
 
     # Get the SQL/binds for the FROM part
-    my $resolved_attrs = { %{$self->_resolved_attrs} };
     my $from_attrs   = (
-        $storage->_select_args( $resolved_attrs->{from}, '*', {}, $resolved_attrs )
+        $storage->_select_args( $resolved_attrs->{from}, $select_args, {}, $resolved_attrs )
     )[4];  # just get the $attrs hash back again
 
     my ($from_sql, $from_bind);
@@ -129,7 +136,7 @@ sub multi_table_update {
 
     # Get the SQL/binds for the WHERE part
     my $where_attrs   = (
-        $storage->_select_args( $resolved_attrs->{from}, '*', $resolved_attrs->{where}, $resolved_attrs )
+        $storage->_select_args( $resolved_attrs->{from}, $select_args, $resolved_attrs->{where}, $resolved_attrs )
     )[4];  # just get the $attrs hash back again
 
     my ($where_sql, $where_bind);
