@@ -115,12 +115,16 @@ sub multi_table_update {
     my $select_args = delete $resolved_attrs->{select} // ['*'];
     push @$select_args, keys %$values;
 
+    # Need a more complex set than just $rsrc->columns_info, since relationship
+    # aliases are probably being used.
+    my $colinfo = $storage->_resolve_column_info($resolved_attrs->{from});
+
     # Get the SQL/binds for the SET part
     my ($set_sql, $set_bind);
     ($set_sql, @$set_bind) = $sql_maker->update('DUAL', $values);  # no WHERE
     $set_sql =~ s/^UPDATE DUAL //;  # no UPDATE header
 
-    $set_bind = $storage->_resolve_bindattrs( $rsrc, $set_bind, $rsrc->columns_info );
+    $set_bind = $storage->_resolve_bindattrs( $rsrc, $set_bind, $colinfo );
 
     # Get the SQL/binds for the FROM part
     my $from_attrs   = (
