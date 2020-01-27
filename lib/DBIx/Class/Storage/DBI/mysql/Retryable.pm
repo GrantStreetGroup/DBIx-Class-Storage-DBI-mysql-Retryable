@@ -200,7 +200,25 @@ sub _set_dbi_connect_info {
     my $info = $self->_dbi_connect_info;
 
     # Not even going to attempt this one...
-    return if ref $info eq 'CODE';
+    if (ref $info eq 'CODE') {
+        warn <<"EOW" unless $ENV{DBIC_RETRYABLE_DONT_SET_CONNECT_SESSION_VARS};
+
+***************************************************************************
+Your connect_info is a coderef, which means connection-based MySQL timeouts
+cannot be dynamically changed. Under certain conditions, the connection (or
+combination of connection attempts) may take longer to timeout than your
+current retryable_timeout setting.
+
+You'll want to revert to a 4-element style DBI argument set, to fully
+support the retryable_timeout functionality.
+
+To disable this warning, set a true value to the environment variable
+DBIC_RETRYABLE_DONT_SET_CONNECT_SESSION_VARS
+
+***************************************************************************
+EOW
+        return;
+}
 
     my $dbi_attr = $info->[3];
     return unless $dbi_attr && ref $dbi_attr eq 'HASH';
