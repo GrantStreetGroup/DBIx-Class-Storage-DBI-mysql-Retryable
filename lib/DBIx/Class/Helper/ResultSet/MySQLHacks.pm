@@ -50,7 +50,11 @@ sub multi_table_delete {
 
     my ($sql, $bind);
     ($sql, @$bind) = @${ $self->count_rs->as_query };
+
+    # Remove (useless) outside parentheses
     $sql =~ s/^\(\s*(.+)\s*\)$/$1/s;
+
+    # Convert "SELECT COUNT(*) FROM" to "DELETE @aliases"
     $sql =~ s/^SELECT COUNT[()*\s]+(?= FROM)/DELETE $alias_str/;
 
     my $rv = $self->dbh_execute($sql, $bind);
@@ -132,7 +136,7 @@ sub multi_table_update {
 
     my ($from_sql, $from_bind);
     ($from_sql, @$from_bind) = $sql_maker->select($from_attrs->{from});  # no WHERE, just * for the column list
-    $from_sql =~ s/^\(\s*(.+)\s*\)$/$1/s;
+    $from_sql =~ s/^\(\s*(.+)\s*\)$/$1/s;  # remove (useless) outside parentheses
     $from_sql =~ s/^SELECT \* FROM //;
 
     $from_bind = $storage->_resolve_bindattrs( $from_attrs->{from}, $from_bind );
