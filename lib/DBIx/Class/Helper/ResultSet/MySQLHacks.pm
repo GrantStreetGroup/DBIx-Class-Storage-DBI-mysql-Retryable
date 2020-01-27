@@ -4,9 +4,8 @@ use v5.10;
 
 use base 'DBIx::Class::ResultSet';
 
-=head1 NAME
-
-DBIx::Class::Helper::ResultSet::MySQLHacks - Useful MySQL-specific operations for DBIx::Class
+# ABSTRACT: Useful MySQL-specific operations for DBIx::Class
+# VERSION
 
 =head1 DESCRIPTION
 
