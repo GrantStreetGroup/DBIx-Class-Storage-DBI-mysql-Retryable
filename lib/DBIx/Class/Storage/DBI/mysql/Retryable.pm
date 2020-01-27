@@ -358,7 +358,8 @@ sub _blockrunner_retry_handler {
     $self->_retryable_last_attempt_time(time);
 
     # Force a disconnect
-    eval { $self->disconnect };
+    local $@;
+    eval { local $SIG{__DIE__}; $self->disconnect };
 
     return 1;
 }
