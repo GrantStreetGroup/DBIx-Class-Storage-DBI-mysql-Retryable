@@ -64,9 +64,11 @@ connection failures, etc.), the retry process starts:
 
     Warn about error if warn_on_retryable_error is on
 
-    If the last attempt took under 2 seconds:
-        Sleep for 2 ** (A/2) seconds (A=Attempt count)
-            (ie: 1.4, 2, 2.8, 4, 5.7, 8, etc.)
+    S = 2 ** (A/2) seconds (A=Attempt count)
+        (ie: 1.4, 2, 2.8, 4, 5.7, 8, etc.)
+
+    If the last attempt (LAS) took under S seconds:
+        Sleep for S-LAS seconds
 
     Force disconnection of database handle
 
@@ -97,8 +99,11 @@ the retry process starts:
 
     Die if we're out of time
 
-    If the last attempt took under 2 seconds:
-        Sleep for 2 ** (A/2) or T/2 seconds, whichever is smaller
+    S = 2 ** (A/2) seconds (A=Attempt count)
+        (ie: 1.4, 2, 2.8, 4, 5.7, 8, etc.)
+
+    If the last attempt (LAS) took under S seconds:
+        Sleep for S-LAS or T/2 seconds, whichever is smaller
         T is readjusted
 
     Force disconnection of database handle
@@ -342,30 +347,34 @@ sub _blockrunner_retry_handler {
     $last_error =~ s/\n.+//s;
     warn "\nEncountered a recoverable error during attempt $failed of $max: $last_error\n\n" if $self->warn_on_retryable_error;
 
-    # Figure out sleep time and timeouts
+    # Figure out all of the times, timers, and timeouts
     my $epoch = time;
-    my $sleep_time = 2 ** ($failed / 2);
+
+    my $this_attempt_time  = $epoch - $self->_retryable_last_attempt_time;
+    my $total_attempt_time = $epoch - $self->_retryable_first_attempt_time;
+
+    my $sleep_time = 2 ** ($failed / 2) - $this_attempt_time;
     my $time_left  = $self->retryable_timeout ?
-        $self->retryable_timeout - ($epoch - $self->_retryable_first_attempt_time) :
+        $self->retryable_timeout - $total_attempt_time :
         86400  # infinity, basically
     ;
-    my $this_attempt_time = $epoch - $self->_retryable_last_attempt_time;
+    my $max_timeout = $time_left / 2;
+    $sleep_time = min(max(0, $sleep_time), $max_timeout);  # make $sleep_time between 0 and $max_timeout
 
     # Time's up!
     return $self->_reset_counters_and_timers($br) if $time_left < 0;
 
-    # If the response was quick (under two seconds), sleep for a bit
-    if ($this_attempt_time < 2) {
-        $sleep_time = $time_left / 2 if $sleep_time > $time_left / 2;
-
+    # If the response was quick and below our attempt timer, sleep for a bit
+    if ($sleep_time > 0) {
         sleep $sleep_time;
-        $time_left -= $sleep_time;
+        $time_left  -= $sleep_time;
+        $max_timeout = $time_left / 2;
     }
 
     if ($self->retryable_timeout) {
         # Use half of the time we have left for the next timeout, but make sure it's at least
         # five seconds
-        my $new_timeout = floor( max($time_left / 2, 5) );
+        my $new_timeout = floor( max($max_timeout, 5) );
         $self->_retryable_current_timeout($new_timeout);
 
         # Reset the connection timeouts before we connect again

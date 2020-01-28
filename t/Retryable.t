@@ -164,7 +164,7 @@ subtest 'recoverable_failures' => sub {
     local $EXEC_COUNTER    = 0;
 
     run_update_test(
-        duration => $EXEC_SUCCESS_AT * 2,  # hitting minimum 2s wait time for each retry
+        duration => 1.41 + 2 + 2.83,  # hitting minimum exponential timeouts each time
         attempts => $EXEC_SUCCESS_AT,
     );
 };
