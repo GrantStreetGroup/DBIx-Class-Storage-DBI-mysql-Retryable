@@ -7,6 +7,30 @@ use base 'DBIx::Class::ResultSet';
 # ABSTRACT: Useful MySQL-specific operations for DBIx::Class
 # VERSION
 
+=head1 SYNOPSIS
+
+    # Your base resultset
+    package MySchema::ResultSet;
+
+    use strict;
+    use warnings;
+
+    use parent 'DBIx::Class::ResultSet';
+
+    __PACKAGE__->load_components('Helper::ResultSet::MySQLHacks');
+
+    # In other resultset classes
+    package MySchema::ResultSet::Bar;
+
+    use strict;
+    use warnings;
+
+    use parent 'MySchema::ResultSet';
+
+    # In code using the resultset
+    $rs->multi_table_delete(qw< rel1 rel2 >);
+    $rs->multi_table_update(\%values);
+
 =head1 DESCRIPTION
 
 This MySQL-specific ResultSet helper contains a series of hacks for various SQL
