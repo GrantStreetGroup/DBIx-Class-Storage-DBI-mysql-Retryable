@@ -13,6 +13,7 @@ requires 'DBIx::Class';
 test_requires 'Class::Load';
 test_requires 'Path::Class';
 test_requires 'Test2::Suite';
+test_requires 'Test2::Tools::Explain';
 
 on develop => sub {
     requires 'Dist::Zilla::PluginBundle::Author::GSG::Internal';
