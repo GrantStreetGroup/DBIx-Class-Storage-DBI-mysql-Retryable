@@ -210,7 +210,7 @@ subtest 'ran_out_of_attempts' => sub {
     run_update_test(
         duration  => 4 * $EXEC_SLEEP_TIME,
         attempts  => 4,
-        exception => qr/Reached max_attempts amount of 4, latest exception: DBI Exception: DBD::mysql::st execute failed: Lost connection to MySQL server during query/,
+        exception => qr/Reached max_attempts amount of 4, latest exception:.+DBI Exception: DBD::mysql::st execute failed: Lost connection to MySQL server during query/,
     );
 
     $storage->max_attempts(8);
