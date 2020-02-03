@@ -83,49 +83,55 @@ sub run_update_test {
     $args{attempts} //= 1;
     $args{timeout}  //= 25;  # half of 50s timeout
 
-    # Changing storage variables may require some resetting
-    $storage->connect_info( $storage->_connect_info );
-    $storage->disconnect;
-
-    my $start_time = time;
-
-    if ($args{exception}) {
-        like(
-            dies {
-                $schema->resultset('Track')->update({ track_id => 1 });
-            },
-            $args{exception},
-            'SQL dies with proper exception',
-        );
-    }
-    else {
-        try_ok {
-            $schema->resultset('Track')->update({ track_id => 1 });
-        }
-        'SQL successful';
-    }
-
-    # Always add two seconds for lag and code runtimes
-    my $duration = time - $start_time;
-    note sprintf "Duration: %.2f seconds (range: %u-%u)", $duration, $args{duration}, $args{duration} + 2;
-    cmp_ok $duration, '>=', $args{duration},     'expected duration (>=)';
-    cmp_ok $duration, '<=', $args{duration} + 2, 'expected duration (<=)';
-
-    is $EXEC_COUNTER,      $args{attempts}, 'expected attempts counter';
-
     SKIP: {
-        skip "CDTEST_DSN not set to a MySQL DB",           8 unless $CDTEST_DSN && $CDTEST_DSN =~ /^dbi:mysql:/;
-        skip "Retryable timeouts are not on in this test", 8 unless $storage->retryable_timeout;
-        skip "Retryable is disabled",                      8 if     $storage->disable_retryable;
+        # SQLite does not recognize SET SESSION commands
+        skip "CDTEST_DSN not set to a MySQL DB for a retryable_timeout test", 12
+            if $storage->retryable_timeout && !($CDTEST_DSN && $CDTEST_DSN =~ /^dbi:mysql:/);
 
-        my $dbh           = $storage->_dbh;
-        my $connect_attrs = $storage->_dbi_connect_info->[3];
-        is $connect_attrs->{$_}, $args{timeout}, "$_ (attr) was reset" for map { "mysql_${_}_timeout" } qw< connect read write >;
+        # Changing storage variables may require some resetting
+        $storage->connect_info( $storage->_connect_info );
+        $storage->disconnect;
 
-        my $timeout_vars = $dbh->selectall_hashref("SHOW VARIABLES LIKE '%_timeout'", 'Variable_name');
-        is $timeout_vars->{$_}{Value}, $args{timeout}, "$_ (session var) was reset" for map { "${_}_timeout" } qw<
-            wait lock_wait innodb_lock_wait net_read net_write
-        >;
+        my $start_time = time;
+
+        if ($args{exception}) {
+            like(
+                dies {
+                    $schema->resultset('Track')->update({ track_id => 1 });
+                },
+                $args{exception},
+                'SQL dies with proper exception',
+            );
+        }
+        else {
+            try_ok {
+                $schema->resultset('Track')->update({ track_id => 1 });
+            }
+            'SQL successful';
+        }
+
+        # Always add two seconds for lag and code runtimes
+        my $duration = time - $start_time;
+        note sprintf "Duration: %.2f seconds (range: %u-%u)", $duration, $args{duration}, $args{duration} + 2;
+        cmp_ok $duration, '>=', $args{duration},     'expected duration (>=)';
+        cmp_ok $duration, '<=', $args{duration} + 2, 'expected duration (<=)';
+
+        is $EXEC_COUNTER,      $args{attempts}, 'expected attempts counter';
+
+        SKIP: {
+            skip "CDTEST_DSN not set to a MySQL DB",           8 unless $CDTEST_DSN && $CDTEST_DSN =~ /^dbi:mysql:/;
+            skip "Retryable timeouts are not on in this test", 8 unless $storage->retryable_timeout;
+            skip "Retryable is disabled",                      8 if     $storage->disable_retryable;
+
+            my $dbh           = $storage->_dbh;
+            my $connect_attrs = $storage->_dbi_connect_info->[3];
+            is $connect_attrs->{$_}, $args{timeout}, "$_ (attr) was reset" for map { "mysql_${_}_timeout" } qw< connect read write >;
+
+            my $timeout_vars = $dbh->selectall_hashref("SHOW VARIABLES LIKE '%_timeout'", 'Variable_name');
+            is $timeout_vars->{$_}{Value}, $args{timeout}, "$_ (session var) was reset" for map { "${_}_timeout" } qw<
+                wait lock_wait innodb_lock_wait net_read net_write
+            >;
+        };
     };
 }
 
