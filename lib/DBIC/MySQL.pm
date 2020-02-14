@@ -1,4 +1,4 @@
-package DBIx::Class::MySQL;
+package DBIC::MySQL;
 
 # ABSTRACT: Extra MySQL modules for DBIx::Class
 # VERSION
