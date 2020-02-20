@@ -149,7 +149,7 @@ sub multi_table_update {
     # Get the SQL/binds for the SET part
     my ($set_sql, $set_bind);
     ($set_sql, @$set_bind) = $sql_maker->update('DUAL', $values);  # no WHERE
-    $set_sql =~ s/^UPDATE DUAL //;  # no UPDATE header
+    $set_sql =~ s/^UPDATE `?DUAL`? //;  # no UPDATE header
 
     $set_bind = $storage->_resolve_bindattrs( $rsrc, $set_bind, $colinfo );
 
