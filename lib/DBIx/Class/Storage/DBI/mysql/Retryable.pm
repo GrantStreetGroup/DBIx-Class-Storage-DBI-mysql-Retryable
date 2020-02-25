@@ -365,7 +365,9 @@ sub _blockrunner_do {
 
     return preserve_context {
         $br->run(sub {
-            $self->$run_target( $self->_get_dbh, @$args )
+            # dbh_do and txn_do have different sub arguments
+            if ($wrap_txn) { $run_target->( @$args ); }
+            else           { $self->$run_target( $self->_get_dbh, @$args ); }
         });
     }
     after => sub { $self->_reset_counters_and_timers($br) };
