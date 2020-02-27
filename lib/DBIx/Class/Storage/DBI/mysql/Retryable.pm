@@ -15,7 +15,8 @@ use namespace::clean;
 # VERSION
 
 __PACKAGE__->mk_group_accessors('inherited' => qw<
-    retryable_timeout max_attempts warn_on_retryable_error disable_retryable
+    max_attempts retryable_timeout aggressive_timeouts
+    warn_on_retryable_error disable_retryable
 >);
 
 __PACKAGE__->mk_group_accessors('simple' => qw<
@@ -26,6 +27,7 @@ __PACKAGE__->mk_group_accessors('simple' => qw<
 # Set defaults
 __PACKAGE__->max_attempts(8);
 __PACKAGE__->retryable_timeout(0);
+__PACKAGE__->aggressive_timeouts(0);
 __PACKAGE__->warn_on_retryable_error(0);
 __PACKAGE__->disable_retryable(0);
 
@@ -42,6 +44,7 @@ __PACKAGE__->disable_retryable(0);
     my $storage_class = 'DBIx::Class::Storage::DBI::mysql::Retryable';
     $storage_class->max_attempts(8);             # default
     $storage_class->retryable_timeout(50);       # default is 0 (off)
+    $storage_class->aggressive_timeouts(0);      # default
     $storage_class->warn_on_retryable_error(0);  # default
     $storage_class->disable_retryable(0);        # default
 
@@ -77,11 +80,12 @@ connection failures, etc.), the retry process starts:
 =head3 With retryable_timeout
 
 A DBIC command triggers some sort of connection to the MySQL server to send SQL.  First,
-Retryable makes sure the connection C<mysql_*_timeout> values are set to one-half of the
-L</retryable_timeout> setting ("R").  If the connection was successful, a few
-C<SET SESSION> commands for timeouts are sent first:
+Retryable makes sure the connection C<mysql_*_timeout> values (except C<mysql_read_timeout>
+unless L</aggressive_timeouts> is set) are set to one-half of the L</retryable_timeout>
+setting ("R").  If the connection was successful, a few C<SET SESSION> commands for
+timeouts are sent first:
 
-    wait_timeout
+    wait_timeout   # only with aggressive_timeouts=1
     lock_wait_timeout
     innodb_lock_wait_timeout
     net_read_timeout
@@ -141,6 +145,36 @@ has left.
 
 Default is off.
 
+=head2 aggressive_timeouts
+
+Boolean that controls whether to use some of the more aggressive, query-unfriendly
+timeouts:
+
+=over
+
+=item mysql_read_timeout
+
+Controls the timeout for all read operations.  Since SQL queries in the middle of
+sending its first set of row data are still considered to be in a read operation, those
+queries could time out during those circumstances.
+
+If you're confident that you don't have any SQL statements that would take longer than
+C<R/2> (or at least returning results before that time), you can turn this option on.
+Otherwise, you may experience longer-running statements going into a retry death spiral
+until they finally hit the Retryable timeout for good and die.
+
+=item wait_timeout
+
+Controls how long the MySQL server waits for activity from the connection before timing
+out.  While most applications are going to be using the database connection pretty
+frequently, the MySQL default (8 hours) is much much longer than the mere seconds this
+engine would set it to.
+
+=back
+
+Default is off.  Obviously, this setting only makes sense with L</retryable_timeout>
+turned on.
+
 =head2 warn_on_retryable_error
 
 Boolean that controls whether to warn on retryable failures, as the engine encounters
@@ -168,6 +202,30 @@ Default is off.
 
 =cut
 
+# Return the list of timeout strings to check
+sub _timeout_set_list {
+    my ($self, $type) = @_;
+
+    my @timeout_set;
+    if    ($type eq 'dbi') {
+        @timeout_set = (qw< connect write >);
+        push @timeout_set, 'read' if $self->aggressive_timeouts;
+
+        @timeout_set = map { "mysql_${_}_timeout" } @timeout_set;
+    }
+    elsif ($type eq 'session') {
+        @timeout_set = (qw< lock_wait innodb_lock_wait net_read net_write >);
+        push @timeout_set, 'wait' if $self->aggressive_timeouts;
+
+        @timeout_set = map { "${_}_timeout" } @timeout_set;
+    }
+    else {
+        die "Unknown mysql timeout set: $type";
+    }
+
+    return @timeout_set;
+}
+
 # Set the timeouts for reconnections by inserting them into the default DBI connection
 # attributes.
 sub _default_dbi_connect_attributes () {
@@ -183,7 +241,7 @@ sub _default_dbi_connect_attributes () {
     my $timeout = floor $self->_retryable_current_timeout;
 
     return +{
-        (map {; "mysql_${_}_timeout" => $timeout } (qw< connect read write >)),  # set timeouts
+        (map {; $_ => $timeout } $self->_timeout_set_list('dbi')),  # set timeouts
         mysql_auto_reconnect => 0,  # do not use MySQL's own reconnector
         %{ $self->next::method },   # inherit the other default attributes
     };
@@ -228,7 +286,7 @@ EOW
     my $dbi_attr = $info->[3];
     return unless $dbi_attr && ref $dbi_attr eq 'HASH';
 
-    $dbi_attr->{"mysql_${_}_timeout"} = $timeout for qw< connect read write >;
+    $dbi_attr->{$_} = $timeout for $self->_timeout_set_list('dbi');
 }
 
 # Set session timeouts for post-connection variables
@@ -257,13 +315,7 @@ sub _set_retryable_session_timeouts {
     eval {
         my $dbh = $self->_dbh;
         if ($dbh) {
-            $dbh->do("SET SESSION ${_}=$timeout") for qw<
-                wait_timeout
-                lock_wait_timeout
-                innodb_lock_wait_timeout
-                net_read_timeout
-                net_write_timeout
-            >;
+            $dbh->do("SET SESSION $_=$timeout") for $self->_timeout_set_list('session');
         }
     };
     if (my $error = $@) {
@@ -328,7 +380,9 @@ sub _blockrunner_do {
 
     return preserve_context {
         $br->run(sub {
-            $self->$run_target( $self->_get_dbh, @$args )
+            # dbh_do and txn_do have different sub arguments
+            if ($wrap_txn) { $run_target->( @$args ); }
+            else           { $self->$run_target( $self->_get_dbh, @$args ); }
         });
     }
     after => sub { $self->_reset_counters_and_timers($br) };

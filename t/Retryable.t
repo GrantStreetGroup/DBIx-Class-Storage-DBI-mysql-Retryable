@@ -45,13 +45,15 @@ our @EXEC_ERRORS     = (
     'WSREP has not yet prepared node for application use',
     'Server shutdown in progress',
 );
+our $EXEC_UPDATE_SQL = 'SELECT 1';
+our $EXEC_ACTUALLY_EXECUTE = 0;
 
 no warnings 'redefine';
 *DBIx::Class::Storage::DBI::_dbh_execute = sub {
     my ($self, $dbh, $sql, $bind, $bind_attrs) = @_;
 
-    # The SQL is always SELECT 1 for the UPDATEs, but not for SET SESSION commands
-    $sql = 'SELECT 1' if $sql =~ /UPDATE/i;
+    # The SQL is always $EXEC_UPDATE_SQL for the UPDATEs, but not for SET SESSION commands
+    $sql = $EXEC_UPDATE_SQL if $sql =~ /UPDATE/i;
 
     my $sth = $self->_bind_sth_params(
         $self->_prepare_sth($dbh, $sql),
@@ -59,17 +61,21 @@ no warnings 'redefine';
         {},
     );
 
-    sleep $EXEC_SLEEP_TIME if $EXEC_SLEEP_TIME;
-
     # Zero-based error, then one-based counter MOD check
     my $error = $EXEC_ERRORS[ $EXEC_COUNTER % @EXEC_ERRORS ];
+
+    my $rv = '0E0';
+    if ($EXEC_ACTUALLY_EXECUTE) {
+        $rv = eval { $sth->execute };
+        $error = $@ if $@;
+    }
+
+    sleep $EXEC_SLEEP_TIME if $EXEC_SLEEP_TIME;
 
     $EXEC_COUNTER++;
     $self->throw_exception(
         "DBI Exception: DBD::mysql::st execute failed: $error"
     ) if $EXEC_COUNTER % $EXEC_SUCCESS_AT;  # only success at exact divisors
-
-    my $rv = '0E0';
 
     return (wantarray ? ($rv, $sth, @$bind) : $rv);
 };
@@ -123,14 +129,19 @@ sub run_update_test {
             skip "Retryable timeouts are not on in this test", 8 unless $storage->retryable_timeout;
             skip "Retryable is disabled",                      8 if     $storage->disable_retryable;
 
-            my $dbh           = $storage->_dbh;
+            my $dbh           = $storage->dbh;
             my $connect_attrs = $storage->_dbi_connect_info->[3];
-            is $connect_attrs->{$_}, $args{timeout}, "$_ (attr) was reset" for map { "mysql_${_}_timeout" } qw< connect read write >;
+            is $connect_attrs->{$_}, $args{timeout}, "$_ (attr) was reset" for map { "mysql_${_}_timeout" } qw< connect write >;
 
             my $timeout_vars = $dbh->selectall_hashref("SHOW VARIABLES LIKE '%_timeout'", 'Variable_name');
             is $timeout_vars->{$_}{Value}, $args{timeout}, "$_ (session var) was reset" for map { "${_}_timeout" } qw<
-                wait lock_wait innodb_lock_wait net_read net_write
+                lock_wait innodb_lock_wait net_read net_write
             >;
+
+            skip "Aggressive timeouts are not on in this test", 2 unless $storage->aggressive_timeouts;
+
+            is $connect_attrs->{$_}, $args{timeout}, "$_ (attr) was reset" for ('mysql_read_timeout');
+            is $timeout_vars->{$_}{Value}, $args{timeout}, "$_ (session var) was reset" for ('wait_timeout');
         };
     };
 }
@@ -262,6 +273,47 @@ subtest 'failure_with_disable_retryable' => sub {
     );
 
     $storage->disable_retryable(0);
+};
+
+subtest 'aggressive_timeouts_off' => sub {
+    local $EXEC_COUNTER    = 0;
+    local $EXEC_SUCCESS_AT = 1;
+    local $EXEC_SLEEP_TIME = 0;
+    local $EXEC_UPDATE_SQL = 'SELECT SLEEP(17)';
+    local $EXEC_ACTUALLY_EXECUTE = 1;
+
+    $storage->retryable_timeout(22);
+    $storage->aggressive_timeouts(0);
+
+    run_update_test(
+        duration  => 17,
+        attempts  => 1,
+        timeout   => 11,  # half of 22s timeout
+    );
+
+    $storage->retryable_timeout(0);
+    $storage->aggressive_timeouts(0);
+};
+
+subtest 'aggressive_timeouts_on' => sub {
+    local $EXEC_COUNTER    = 0;
+    local $EXEC_SUCCESS_AT = 8;
+    local $EXEC_SLEEP_TIME = 0;
+    local $EXEC_UPDATE_SQL = 'SELECT SLEEP(17)';
+    local $EXEC_ACTUALLY_EXECUTE = 1;
+
+    $storage->retryable_timeout(22);
+    $storage->aggressive_timeouts(1);
+
+    run_update_test(
+        duration  => 11 + 1.41 + 5 + 2 + 5,  # should get a 5s timeout after the fourth attempt
+        attempts  => 4,
+        timeout   => 11,  # half of 22s timeout
+        exception => qr/DBI Exception: DBD::mysql::st execute failed: Lost connection to MySQL server during query/,
+    );
+
+    $storage->retryable_timeout(0);
+    $storage->aggressive_timeouts(0);
 };
 
 ############################################################
