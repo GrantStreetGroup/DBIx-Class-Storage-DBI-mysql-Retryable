@@ -202,6 +202,30 @@ Default is off.
 
 =cut
 
+# Return the list of timeout strings to check
+sub _timeout_set_list {
+    my ($self, $type) = @_;
+
+    my @timeout_set;
+    if    ($type eq 'dbi') {
+        @timeout_set = (qw< connect write >);
+        push @timeout_set, 'read' if $self->aggressive_timeouts;
+
+        @timeout_set = map { "mysql_${_}_timeout" } @timeout_set;
+    }
+    elsif ($type eq 'session') {
+        @timeout_set = (qw< lock_wait innodb_lock_wait net_read net_write >);
+        push @timeout_set, 'wait' if $self->aggressive_timeouts;
+
+        @timeout_set = map { "${_}_timeout" } @timeout_set;
+    }
+    else {
+        die "Unknown mysql timeout set: $type";
+    }
+
+    return @timeout_set;
+}
+
 # Set the timeouts for reconnections by inserting them into the default DBI connection
 # attributes.
 sub _default_dbi_connect_attributes () {
@@ -216,11 +240,8 @@ sub _default_dbi_connect_attributes () {
 
     my $timeout = floor $self->_retryable_current_timeout;
 
-    my @mysql_timeout_set = (qw< connect write >);
-    push @mysql_timeout_set, 'read' if $self->aggressive_timeouts;
-
     return +{
-        (map {; "mysql_${_}_timeout" => $timeout } @mysql_timeout_set),  # set timeouts
+        (map {; $_ => $timeout } $self->_timeout_set_list('dbi')),  # set timeouts
         mysql_auto_reconnect => 0,  # do not use MySQL's own reconnector
         %{ $self->next::method },   # inherit the other default attributes
     };
@@ -265,10 +286,7 @@ EOW
     my $dbi_attr = $info->[3];
     return unless $dbi_attr && ref $dbi_attr eq 'HASH';
 
-    my @mysql_timeout_set = (qw< connect write >);
-    push @mysql_timeout_set, 'read' if $self->aggressive_timeouts;
-
-    $dbi_attr->{"mysql_${_}_timeout"} = $timeout for @mysql_timeout_set;
+    $dbi_attr->{$_} = $timeout for $self->_timeout_set_list('dbi');
 }
 
 # Set session timeouts for post-connection variables
@@ -294,13 +312,10 @@ sub _set_retryable_session_timeouts {
     # put it in a basic eval, and do a quick is_dbi_error_retryable check.  If it passes,
     # let the next *_do/_do_query call handle it.
 
-    my @session_timeout_set = (qw< lock_wait innodb_lock_wait net_read net_write >);
-    push @session_timeout_set, 'wait' if $self->aggressive_timeouts;
-
     eval {
         my $dbh = $self->_dbh;
         if ($dbh) {
-            $dbh->do("SET SESSION ${_}_timeout=$timeout") for @session_timeout_set;
+            $dbh->do("SET SESSION $_=$timeout") for $self->_timeout_set_list('session');
         }
     };
     if (my $error = $@) {
