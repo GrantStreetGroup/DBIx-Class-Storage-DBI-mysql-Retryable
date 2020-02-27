@@ -129,10 +129,7 @@ sub run_update_test {
             skip "Retryable timeouts are not on in this test", 8 unless $storage->retryable_timeout;
             skip "Retryable is disabled",                      8 if     $storage->disable_retryable;
 
-            # The $dbh may actually be broken if we sent real SQL through.
-            $storage->disconnect if $EXEC_ACTUALLY_EXECUTE && $args{exception};
-
-            my $dbh           = $storage->_dbh;
+            my $dbh           = $storage->dbh;
             my $connect_attrs = $storage->_dbi_connect_info->[3];
             is $connect_attrs->{$_}, $args{timeout}, "$_ (attr) was reset" for map { "mysql_${_}_timeout" } qw< connect write >;
 
@@ -310,7 +307,7 @@ subtest 'aggressive_timeouts_on' => sub {
 
     run_update_test(
         duration  => 11 + 1.41 + 5 + 2 + 5,  # should get a 5s timeout after the fourth attempt
-        attempts  => 3,
+        attempts  => 4,
         timeout   => 11,  # half of 22s timeout
         exception => qr/DBI Exception: DBD::mysql::st execute failed: Lost connection to MySQL server during query/,
     );
