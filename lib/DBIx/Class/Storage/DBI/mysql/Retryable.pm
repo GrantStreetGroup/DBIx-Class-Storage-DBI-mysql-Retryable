@@ -324,6 +324,14 @@ sub _set_retryable_session_timeouts {
     }
 }
 
+# Make sure the initial connection call is protected from retryable failures
+sub _connect {
+    my $self = shift;
+    return $self->next::method() if $self->disable_retryable;
+    # next::can here to do mro calculations prior to sending to _blockrunner_do
+    return $self->_blockrunner_do( _connect => $self->next::can() );
+}
+
 =head2 dbh_do
 
     my $val = $schema->storage->dbh_do(
@@ -352,12 +360,20 @@ See also: L<DBIx::Class::Storage::BlockRunner>.
 # Main "doer" method for both dbh_do and txn_do
 sub _blockrunner_do {
     my $self       = shift;
-    my $wrap_txn   = shift;
+    my $call_type  = shift;
     my $run_target = shift;
 
     # Transaction depth short circuit (same as DBIx::Class::Storage::DBI)
-    return $self->$run_target($self->_get_dbh, @_)
-        if $self->{_in_do_block} || $self->transaction_depth;
+    if ($self->{_in_do_block} || $self->transaction_depth) {
+        return
+            # dbh_do and txn_do have different sub arguments, and _connect shouldn't
+            # have a _get_dbh call.
+            $call_type eq 'txn_do'   ? $run_target->(@_) :
+            $call_type eq 'dbh_do'   ? $self->$run_target($self->_get_dbh, @_) :
+            $call_type eq '_connect' ? $self->$run_target(@_) :
+            die "Unknown call type: $call_type"
+        ;
+    }
 
     # Given our transaction depth short circuits, we should be at the outermost loop,
     # so it's safe to reset our variables.
@@ -373,16 +389,19 @@ sub _blockrunner_do {
     # the result in a context-sensitive manner.
     my $br = DBIx::Class::Storage::BlockRunner->new(
         storage       => $self,
-        wrap_txn      => $wrap_txn,
+        wrap_txn      => $call_type eq 'txn_do',
         max_attempts  => $self->max_attempts,
         retry_handler => \&_blockrunner_retry_handler,
     );
 
     return preserve_context {
         $br->run(sub {
-            # dbh_do and txn_do have different sub arguments
-            if ($wrap_txn) { $run_target->( @$args ); }
-            else           { $self->$run_target( $self->_get_dbh, @$args ); }
+            # dbh_do and txn_do have different sub arguments, and _connect shouldn't
+            # have a _get_dbh call.
+            if    ($call_type eq 'txn_do')   { $run_target->( @$args ); }
+            elsif ($call_type eq 'dbh_do')   { $self->$run_target( $self->_get_dbh, @$args ); }
+            elsif ($call_type eq '_connect') { $self->$run_target( @$args ); }
+            else { die "Unknown call type: $call_type" }
         });
     }
     after => sub { $self->_reset_counters_and_timers($br) };
@@ -442,7 +461,8 @@ sub _blockrunner_retry_handler {
     local $@;
     eval { local $SIG{__DIE__}; $self->disconnect };
 
-    # Because BlockRunner calls this unprotected, we should call this ourselves, in a
+    # Because BlockRunner calls this unprotected, and because our own _connect is going
+    # to hit the _in_do_block short-circuit, we should call this ourselves, in a
     # protected eval, and re-direct any errors as if it was another failed attempt.
     eval { $self->ensure_connected };
     if (my $connect_error = $@) {
@@ -477,7 +497,7 @@ sub _reset_counters_and_timers {
 sub dbh_do {
     my $self = shift;
     return $self->next::method(@_) if $self->disable_retryable;
-    return $self->_blockrunner_do(0, @_);
+    return $self->_blockrunner_do( dbh_do => @_ );
 }
 
 =head2 txn_do
@@ -504,7 +524,7 @@ sub txn_do {
     # DBIx::Class::Storage::DBI)
     $self->_get_dbh;
 
-    $self->_blockrunner_do(1, @_);
+    $self->_blockrunner_do( txn_do => @_ );
 }
 
 =head2 is_dbi_error_retryable
