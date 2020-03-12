@@ -442,6 +442,18 @@ sub _blockrunner_retry_handler {
     local $@;
     eval { local $SIG{__DIE__}; $self->disconnect };
 
+    # Because BlockRunner calls this unprotected, we should call this ourselves, in a
+    # protected eval, and re-direct any errors as if it was another failed attempt.
+    eval { $self->ensure_connected };
+    if (my $connect_error = $@) {
+        push @{ $br->exception_stack }, $connect_error;
+
+        # This will throw if max_attempts is reached
+        $br->_set_failed_attempt_count($br->failed_attempt_count + 1);
+
+        return _blockrunner_retry_handler($br);
+    }
+
     return 1;
 }
 
