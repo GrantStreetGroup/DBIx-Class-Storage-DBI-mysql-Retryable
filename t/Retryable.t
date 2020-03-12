@@ -48,6 +48,8 @@ our @EXEC_ERRORS     = (
 our $EXEC_UPDATE_SQL = 'SELECT 1';
 our $EXEC_ACTUALLY_EXECUTE = 0;
 
+our $UPDATE_FAILED = 0;
+
 no warnings 'redefine';
 *DBIx::Class::Storage::DBI::_dbh_execute = sub {
     my ($self, $dbh, $sql, $bind, $bind_attrs) = @_;
@@ -73,13 +75,36 @@ no warnings 'redefine';
     sleep $EXEC_SLEEP_TIME if $EXEC_SLEEP_TIME;
 
     $EXEC_COUNTER++;
-    $self->throw_exception(
-        "DBI Exception: DBD::mysql::st execute failed: $error"
-    ) if $EXEC_COUNTER % $EXEC_SUCCESS_AT;  # only success at exact divisors
+    if ($EXEC_COUNTER % $EXEC_SUCCESS_AT) {  # only success at exact divisors
+        $UPDATE_FAILED = 1;
+        $self->throw_exception(
+            "DBI Exception: DBD::mysql::st execute failed: $error"
+        );
+    }
 
+    $UPDATE_FAILED = 0;
     return (wantarray ? ($rv, $sth, @$bind) : $rv);
 };
 use warnings 'redefine';
+
+my $orig_ensure_connected = \&DBIx::Class::Storage::DBI::ensure_connected;
+sub _ensure_connected_test {
+    my ($self) = @_;
+    return $orig_ensure_connected->($self) unless $UPDATE_FAILED;
+    $UPDATE_FAILED = 0;
+
+    # Zero-based error, then one-based counter MOD check
+    my $error = $EXEC_ERRORS[ $EXEC_COUNTER % @EXEC_ERRORS ];
+
+    sleep $EXEC_SLEEP_TIME if $EXEC_SLEEP_TIME;
+
+    $EXEC_COUNTER++;
+    $self->throw_exception(
+        "DBI Connection failed: DBI connect(...) failed: $error"
+    ) if $EXEC_COUNTER % $EXEC_SUCCESS_AT;  # only success at exact divisors
+
+    return $orig_ensure_connected->($self);
+}
 
 sub run_update_test {
     my %args = @_;
@@ -189,6 +214,22 @@ subtest 'recoverable_failures' => sub {
 subtest 'recoverable_failures_with_longer_pauses' => sub {
     local $EXEC_COUNTER    = 0;
     local $EXEC_SLEEP_TIME = 3;
+
+    run_update_test(
+        duration => $EXEC_SUCCESS_AT * $EXEC_SLEEP_TIME,
+        attempts => $EXEC_SUCCESS_AT,
+    );
+};
+
+subtest 'connection_failure_after_update_failure' => sub {
+    local $EXEC_COUNTER    = 0;
+    local $EXEC_SUCCESS_AT = 3;
+    local $EXEC_SLEEP_TIME = 3;
+
+    $UPDATE_FAILED = 0;
+    no warnings 'redefine';
+    local *DBIx::Class::Storage::DBI::ensure_connected = \&_ensure_connected_test;
+    use warnings 'redefine';
 
     run_update_test(
         duration => $EXEC_SUCCESS_AT * $EXEC_SLEEP_TIME,
