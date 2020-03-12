@@ -87,10 +87,10 @@ no warnings 'redefine';
 };
 use warnings 'redefine';
 
-my $orig_ensure_connected = \&DBIx::Class::Storage::DBI::ensure_connected;
-sub _ensure_connected_test {
+my $orig__connect = \&DBIx::Class::Storage::DBI::_connect;
+sub __connect_test {
     my ($self) = @_;
-    return $orig_ensure_connected->($self) unless $UPDATE_FAILED;
+    return $orig__connect->($self) unless $UPDATE_FAILED;
     $UPDATE_FAILED = 0;
 
     # Zero-based error, then one-based counter MOD check
@@ -103,7 +103,7 @@ sub _ensure_connected_test {
         "DBI Connection failed: DBI connect(...) failed: $error"
     ) if $EXEC_COUNTER % $EXEC_SUCCESS_AT;  # only success at exact divisors
 
-    return $orig_ensure_connected->($self);
+    return $orig__connect->($self);
 }
 
 sub run_update_test {
@@ -228,7 +228,23 @@ subtest 'connection_failure_after_update_failure' => sub {
 
     $UPDATE_FAILED = 0;
     no warnings 'redefine';
-    local *DBIx::Class::Storage::DBI::ensure_connected = \&_ensure_connected_test;
+    local *DBIx::Class::Storage::DBI::_connect = \&__connect_test;
+    use warnings 'redefine';
+
+    run_update_test(
+        duration => $EXEC_SUCCESS_AT * $EXEC_SLEEP_TIME,
+        attempts => $EXEC_SUCCESS_AT,
+    );
+};
+
+subtest 'connection_failure_before_update_failure' => sub {
+    local $EXEC_COUNTER    = 0;
+    local $EXEC_SUCCESS_AT = 2;
+    local $EXEC_SLEEP_TIME = 3;
+
+    $UPDATE_FAILED = 1;
+    no warnings 'redefine';
+    local *DBIx::Class::Storage::DBI::_connect = \&__connect_test;
     use warnings 'redefine';
 
     run_update_test(
