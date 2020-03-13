@@ -35,6 +35,7 @@ my %isa_checks = (
     >,  ''
     ],
     txn_do => [ 'CDTest::Track', '' ],
+    _connect => ['DBIx::Class::Storage::DBI::mysql::Retryable'],
 );
 
 no warnings 'redefine';
@@ -49,6 +50,19 @@ no warnings 'redefine';
 
     my $rv = '0E0';
     return (wantarray ? ($rv, $sth, @$bind) : $rv);
+};
+
+my $orig__connect = \&DBIx::Class::Storage::DBI::_connect;
+*DBIx::Class::Storage::DBI::_connect = sub {
+    my ($self) = @_;
+
+    my $i = 0;
+    foreach my $ref (@{ $isa_checks{_connect} }) {
+        is(ref $_[$i], $ref, "arg $i isa $ref");
+        $i++;
+    }
+
+    return $orig__connect->($self);
 };
 
 *CDTest::Schema::Result::Track::test_dbh_do_vars = sub {
@@ -84,6 +98,11 @@ subtest 'result_passing_to_dbh_do' => sub {
 
 subtest 'result_passing_to_txn_do' => sub {
     $result->test_txn_do_vars(12345);
+};
+
+subtest '_connect_passing' => sub {
+    $storage->disconnect;
+    $storage->ensure_connected;
 };
 
 ############################################################
