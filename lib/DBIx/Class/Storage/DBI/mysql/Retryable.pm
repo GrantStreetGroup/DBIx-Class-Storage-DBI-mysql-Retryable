@@ -363,17 +363,20 @@ sub _blockrunner_do {
     my $call_type  = shift;
     my $run_target = shift;
 
+    # See https://metacpan.org/release/DBIx-Class/source/lib/DBIx/Class/Storage/DBI.pm#L842
+    my $args = @_ ? \@_ : [];
+
+    my $target_runner = sub {
+        # dbh_do and txn_do have different sub arguments, and _connect shouldn't
+        # have a _get_dbh call.
+        if    ($call_type eq 'txn_do')   { $run_target->( @$args ); }
+        elsif ($call_type eq 'dbh_do')   { $self->$run_target( $self->_get_dbh, @$args ); }
+        elsif ($call_type eq '_connect') { $self->$run_target( @$args ); }
+        else { die "Unknown call type: $call_type" }
+    };
+
     # Transaction depth short circuit (same as DBIx::Class::Storage::DBI)
-    if ($self->{_in_do_block} || $self->transaction_depth) {
-        return
-            # dbh_do and txn_do have different sub arguments, and _connect shouldn't
-            # have a _get_dbh call.
-            $call_type eq 'txn_do'   ? $run_target->(@_) :
-            $call_type eq 'dbh_do'   ? $self->$run_target($self->_get_dbh, @_) :
-            $call_type eq '_connect' ? $self->$run_target(@_) :
-            die "Unknown call type: $call_type"
-        ;
-    }
+    return $target_runner->() if $self->{_in_do_block} || $self->transaction_depth;
 
     # Given our transaction depth short circuits, we should be at the outermost loop,
     # so it's safe to reset our variables.
@@ -381,9 +384,6 @@ sub _blockrunner_do {
     $self->_retryable_first_attempt_time($epoch);
     $self->_retryable_last_attempt_time($epoch);
     $self->_retryable_current_timeout( $self->retryable_timeout / 2 ) if $self->retryable_timeout;
-
-    # See https://metacpan.org/release/DBIx-Class/source/lib/DBIx/Class/Storage/DBI.pm#L842
-    my $args = @_ ? \@_ : [];
 
     # We have some post-processing to do, so save the BlockRunner object, and then save
     # the result in a context-sensitive manner.
@@ -395,14 +395,7 @@ sub _blockrunner_do {
     );
 
     return preserve_context {
-        $br->run(sub {
-            # dbh_do and txn_do have different sub arguments, and _connect shouldn't
-            # have a _get_dbh call.
-            if    ($call_type eq 'txn_do')   { $run_target->( @$args ); }
-            elsif ($call_type eq 'dbh_do')   { $self->$run_target( $self->_get_dbh, @$args ); }
-            elsif ($call_type eq '_connect') { $self->$run_target( @$args ); }
-            else { die "Unknown call type: $call_type" }
-        });
+        $br->run($target_runner);
     }
     after => sub { $self->_reset_counters_and_timers($br) };
 }
