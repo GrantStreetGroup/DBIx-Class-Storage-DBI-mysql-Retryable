@@ -534,6 +534,7 @@ sub is_dbi_error_retryable {
 
     # We have to capture just the first error, not other errors that may be buried in the
     # stack trace.
+    $error =  "$error";   # don't corrupt the original error!
     $error =~ s/\n.+//s;
 
     # Disable /x flag to allow for whitespace within string, but turn it on for newlines
