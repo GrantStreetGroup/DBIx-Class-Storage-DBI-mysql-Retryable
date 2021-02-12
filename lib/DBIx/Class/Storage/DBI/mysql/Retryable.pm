@@ -412,9 +412,9 @@ sub _blockrunner_retry_handler {
 
     my ($failed, $max, $last_error) = ($br->failed_attempt_count, $br->max_attempts, $br->last_exception);
 
-    # If we're still connected and it's not a retryable error, stop here
+    # If it's not a retryable error, stop here
     my $parsed_error = $self->parse_error_class->new($last_error);
-    return $self->_reset_counters_and_timers($br) if $self->connected && !$parsed_error->is_transient;
+    return $self->_reset_counters_and_timers($br) unless $parsed_error->is_transient;
 
     $last_error =~ s/\n.+//s;
     warn "\nEncountered a recoverable error during attempt $failed of $max: $last_error\n\n" if $self->warn_on_retryable_error;
