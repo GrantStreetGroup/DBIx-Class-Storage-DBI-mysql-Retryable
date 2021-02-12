@@ -3,6 +3,7 @@ requires 'perl', 'v5.10.0'; # for kwalitee
 
 # Direct requirements
 requires 'Context::Preserve';
+requires 'DBIx::ParseError::MySQL';
 requires 'namespace::clean';
 
 # Indirect (or bundled) requirements

@@ -6,6 +6,7 @@ use warnings;
 use base qw< DBIx::Class::Storage::DBI::mysql >;
 
 use Context::Preserve;
+use DBIx::ParseError::MySQL;
 use List::Util  qw< min max >;
 use POSIX       qw< floor >;
 use Time::HiRes qw< time sleep >;
@@ -15,6 +16,7 @@ use namespace::clean;
 # VERSION
 
 __PACKAGE__->mk_group_accessors('inherited' => qw<
+    parse_error_class
     max_attempts retryable_timeout aggressive_timeouts
     warn_on_retryable_error disable_retryable
 >);
@@ -25,6 +27,7 @@ __PACKAGE__->mk_group_accessors('simple' => qw<
 >);
 
 # Set defaults
+__PACKAGE__->parse_error_class('DBIx::ParseError::MySQL');
 __PACKAGE__->max_attempts(8);
 __PACKAGE__->retryable_timeout(0);
 __PACKAGE__->aggressive_timeouts(0);
@@ -309,8 +312,8 @@ sub _set_retryable_session_timeouts {
 
     # Ironically, we aren't running our own SET SESSION commands with their own
     # BlockRunner protection, since that may lead to infinite stack recursion.  Instead,
-    # put it in a basic eval, and do a quick is_dbi_error_retryable check.  If it passes,
-    # let the next *_do/_do_query call handle it.
+    # put it in a basic eval, and do a quick is_transient check.  If it passes, let the
+    # next *_do/_do_query call handle it.
 
     local $@;
     eval {
@@ -320,7 +323,8 @@ sub _set_retryable_session_timeouts {
         }
     };
     if (my $error = $@) {
-        die unless $self->is_dbi_error_retryable($error);  # bare die for $@ propagation
+        my $parsed_error = $self->parse_error_class->new($error);
+        die unless $parsed_error->is_transient;  # bare die for $@ propagation
         warn "Encountered a recoverable error during SET SESSION timeout commands: $error" if $self->warn_on_retryable_error;
     }
 }
@@ -409,7 +413,8 @@ sub _blockrunner_retry_handler {
     my ($failed, $max, $last_error) = ($br->failed_attempt_count, $br->max_attempts, $br->last_exception);
 
     # If we're still connected and it's not a retryable error, stop here
-    return $self->_reset_counters_and_timers($br) if $self->connected && !$self->is_dbi_error_retryable($last_error);
+    my $parsed_error = $self->parse_error_class->new($last_error);
+    return $self->_reset_counters_and_timers($br) if $self->connected && !$parsed_error->is_transient;
 
     $last_error =~ s/\n.+//s;
     warn "\nEncountered a recoverable error during attempt $failed of $max: $last_error\n\n" if $self->warn_on_retryable_error;
@@ -519,61 +524,6 @@ sub txn_do {
     $self->_get_dbh;
 
     $self->_blockrunner_do( txn_do => @_ );
-}
-
-=head2 is_dbi_error_retryable
-
-    my $bool = $storage->is_dbi_error_retryable($dbi_err);
-
-Returns a true value if the DBI error is the kind that should be retried by Retryable.
-These include a wide variety of timeouts, connection failures, and failover messages.
-
-=cut
-
-sub is_dbi_error_retryable {
-    my ($self, $error) = @_;
-
-    # We have to capture just the first error, not other errors that may be buried in the
-    # stack trace.
-    $error =  "$error";   # don't corrupt the original error!
-    $error =~ s/\n.+//s;
-
-    # Disable /x flag to allow for whitespace within string, but turn it on for newlines
-    # and comments.
-    #
-    # These error messages are purposely long and case-sensitive, because we're looking
-    # for these errors -anywhere- in the string.  Best to get as exact of a match as
-    # possible.
-
-    return $error =~ m<
-        # Locks
-        (?-x:Deadlock found when trying to get lock; try restarting transaction)|
-        (?-x:Lock wait timeout exceeded; try restarting transaction)|
-        (?-x:WSREP detected deadlock/conflict and aborted the transaction.\s+Try restarting the transaction)|
-
-        # Connection dropped/interrupted
-        (?-x:MySQL server has gone away)|
-        (?-x:Lost connection to MySQL server)|
-        (?-x:Query execution was interrupted)|
-
-        # Initial connection failure
-        (?-x:Bad handshake)|
-        (?-x:Too many connections)|
-        (?-x:Host '\S+' is blocked because of many connection errors)|
-        (?-x:Can't get hostname for your address)|
-        (?-x:Can't connect to (?:local )?MySQL server)|
-
-        # Packet corruption
-        (?-x:Got a read error from the connection pipe)|
-        (?-x:Got (?:an error|timeout) (?:reading|writing) communication packets)|
-        (?-x:Malformed communication packet)|
-
-        # Failovers
-        (?-x:WSREP has not yet prepared node for application use)|
-        (?-x:Server shutdown in progress)|
-        (?-x:Normal shutdown)|
-        (?-x:Shutdown complete)
-    >x;
 }
 
 =head1 CAVEATS
