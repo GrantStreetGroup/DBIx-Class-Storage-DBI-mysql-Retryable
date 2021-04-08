@@ -312,6 +312,7 @@ sub _set_retryable_session_timeouts {
     # put it in a basic eval, and do a quick is_dbi_error_retryable check.  If it passes,
     # let the next *_do/_do_query call handle it.
 
+    local $@;
     eval {
         my $dbh = $self->_dbh;
         if ($dbh) {
