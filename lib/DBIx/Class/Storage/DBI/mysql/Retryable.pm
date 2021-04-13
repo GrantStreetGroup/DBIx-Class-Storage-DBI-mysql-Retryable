@@ -8,9 +8,10 @@ use base qw< DBIx::Class::Storage::DBI::mysql >;
 use Algorithm::Backoff::RetryTimeouts;
 use Context::Preserve;
 use DBIx::ParseError::MySQL;
-use List::Util  qw< min max >;
-use Storable    qw< dclone >;
-use Time::HiRes qw< time sleep >;
+use List::Util   qw< min max >;
+use Scalar::Util qw< blessed >;
+use Storable     qw< dclone >;
+use Time::HiRes  qw< time sleep >;
 use namespace::clean;
 
 # ABSTRACT: MySQL-specific DBIC storage engine with retry support
@@ -24,6 +25,7 @@ __PACKAGE__->mk_group_accessors('inherited' => qw<
 
 __PACKAGE__->mk_group_accessors('simple' => qw<
     _retryable_timer _retryable_current_timeout
+    _retryable_call_type _retryable_exception_prefix
 >);
 
 # Set defaults
@@ -357,6 +359,11 @@ sub _set_retryable_session_timeouts {
     if (my $error = $@) {
         my $parsed_error = $self->parse_error_class->new($error);
         die unless $parsed_error->is_transient;  # bare die for $@ propagation
+
+        # The error may have been transient, but we might have ran out of retries, anyway
+        my $str_error = "$error";
+        die if $str_error =~ m<Failed \w+ coderef: .+, attempts: \d+ / \d+, timer: [\d\.]+ / [\d\.]+ sec, last exception: >;
+
         warn "Encountered a recoverable error during SET SESSION timeout commands: $error" if $self->warn_on_retryable_error;
     }
 }
@@ -366,7 +373,7 @@ sub _connect {
     my $self = shift;
     return $self->next::method() if $self->disable_retryable;
     # next::can here to do mro calculations prior to sending to _blockrunner_do
-    return $self->_blockrunner_do( _connect => $self->next::can() );
+    return $self->_blockrunner_do( connect => $self->next::can() );
 }
 
 =head2 dbh_do
@@ -406,9 +413,9 @@ sub _blockrunner_do {
     my $target_runner = sub {
         # dbh_do and txn_do have different sub arguments, and _connect shouldn't
         # have a _get_dbh call.
-        if    ($call_type eq 'txn_do')   { $run_target->( @$args ); }
-        elsif ($call_type eq 'dbh_do')   { $self->$run_target( $self->_get_dbh, @$args ); }
-        elsif ($call_type eq '_connect') { $self->$run_target( @$args ); }
+        if    ($call_type eq 'txn_do')  { $run_target->( @$args ); }
+        elsif ($call_type eq 'dbh_do')  { $self->$run_target( $self->_get_dbh, @$args ); }
+        elsif ($call_type eq 'connect') { $self->$run_target( @$args ); }
         else { die "Unknown call type: $call_type" }
     };
 
@@ -422,6 +429,7 @@ sub _blockrunner_do {
     my $timeout = $self->_retryable_timer->timeout;
     $timeout = 0 if $timeout == -1;
     $self->_retryable_current_timeout($timeout);
+    $self->_retryable_call_type($call_type);
 
     # We have some post-processing to do, so save the BlockRunner object, and then save
     # the result in a context-sensitive manner.
@@ -439,7 +447,7 @@ sub _blockrunner_do {
     return preserve_context {
         $br->run($target_runner);
     }
-    after => sub { $self->_reset_counters_and_timers($br) };
+    after => sub { $self->_reset_timers_and_timeouts };
 }
 
 # Our own BlockRunner retry handler
@@ -447,21 +455,21 @@ sub _blockrunner_retry_handler {
     my $br   = shift;
     my $self = $br->storage;  # "self" for this module
 
-    my ($failed, $max, $last_error) = ($br->failed_attempt_count, $br->max_attempts, $br->last_exception);
+    my $last_error = $br->last_exception;
 
     # Record the failure in the timer algorithm (prior to any checks)
     my ($sleep_time, $new_timeout) = $self->_retryable_timer->failure;
 
     # If it's not a retryable error, stop here
     my $parsed_error = $self->parse_error_class->new($last_error);
-    return $self->_reset_counters_and_timers($br) unless $parsed_error->is_transient;
+    return $self->_reset_and_fail('Exception not transient') unless $parsed_error->is_transient;
 
     $last_error =~ s/\n.+//s;
-    warn "\nEncountered a recoverable error during attempt $failed of $max: $last_error\n\n" if $self->warn_on_retryable_error;
+    $self->_warn_retryable_error($last_error) if $self->warn_on_retryable_error;
 
     # Either stop here (because of timeout or max attempts), sleep, or don't
-    if    ($sleep_time == -1) { return $self->_reset_counters_and_timers($br) }
-    elsif ($sleep_time)       { sleep $sleep_time;                            }
+    if    ($sleep_time == -1) { return $self->_reset_and_fail('Out of retries') }
+    elsif ($sleep_time)       { sleep $sleep_time;                              }
 
     if ($new_timeout > 0) {
         # Reset the connection timeouts before we connect again
@@ -483,24 +491,6 @@ sub _blockrunner_retry_handler {
     }
 
     return 1;
-}
-
-sub _reset_counters_and_timers {
-    my ($self, $br) = @_;
-
-    # Only reset timeouts if we have to, but check before we clear
-    my $needs_resetting = $self->_failed_attempt_count && $self->_retryable_current_timeout;
-
-    $self->_retryable_timer(undef);
-    $self->_reset_retryable_timeout;
-
-    if ($needs_resetting) {
-        $self->_set_dbi_connect_info;
-        $self->_set_retryable_session_timeouts;
-    }
-
-    # Useful for chaining to the return call in _blockrunner_retry_handler
-    return undef;
 }
 
 sub dbh_do {
@@ -534,6 +524,89 @@ sub txn_do {
     $self->_get_dbh;
 
     $self->_blockrunner_do( txn_do => @_ );
+}
+
+=head2 throw_exception
+
+    $storage->throw_exception('It failed');
+
+Works just like L<DBIx::Class::Storage/throw_exception>, but also reports attempt and
+timer statistics, in case the transaction was tried multiple times.
+
+=cut
+
+sub _reset_timers_and_timeouts {
+    my $self = shift;
+
+    # Only reset timeouts if we have to, but check before we clear
+    my $needs_resetting = $self->_failed_attempt_count && $self->_retryable_current_timeout;
+
+    $self->_retryable_timer(undef);
+    $self->_reset_retryable_timeout;
+
+    if ($needs_resetting) {
+        $self->_set_dbi_connect_info;
+        $self->_set_retryable_session_timeouts;
+    }
+
+    # Useful for chaining to the return call in _blockrunner_retry_handler
+    return undef;
+}
+
+sub _warn_retryable_error {
+    my ($self, $error) = @_;
+
+    my $timer = $self->_retryable_timer;
+    my $current_attempt_count = $self->_failed_attempt_count + 1;
+    my $debug_msg = sprintf(
+        'Retrying %s coderef, attempt %u of %u, timer: %.1f / %.1f sec, last exception: %s',
+        $self->_retryable_call_type,
+        $current_attempt_count, $self->max_attempts,
+        $timer->{_last_timestamp} - $timer->{_start_timestamp}, $timer->{max_actual_duration},
+        $error
+    );
+
+    warn $debug_msg;
+}
+
+sub _reset_and_fail {
+    my ($self, $fail_reason) = @_;
+
+    # First error: just pass the exception unaltered
+    if ($self->_failed_attempt_count <= 1) {
+        $self->_retryable_exception_prefix(undef);
+        return $self->_reset_timers_and_timeouts;
+    }
+
+    my $timer = $self->_retryable_timer;
+    $self->_retryable_exception_prefix( sprintf(
+        'Failed %s coderef: %s, attempts: %u / %u, timer: %.1f / %.1f sec',
+        $self->_retryable_call_type, $fail_reason,
+        $self->_failed_attempt_count, $self->max_attempts,
+        $timer->{_last_timestamp} - $timer->{_start_timestamp}, $timer->{max_actual_duration},
+    ) );
+
+    return $self->_reset_timers_and_timeouts;
+}
+
+sub throw_exception {
+    my $self = shift;
+
+    # Clear the prefix as we use it
+    my $exception_prefix = $self->_retryable_exception_prefix;
+    $self->_retryable_exception_prefix(undef) if $exception_prefix;
+
+    return $self->next::method(@_) unless $exception_prefix;
+
+    my $error = shift;
+    $exception_prefix .= ', last exception: ';
+    if (blessed $error && $error->isa('DBIx::Class::Exception')) {
+        $error->{msg} = $exception_prefix.$error->{msg};
+    }
+    else {
+        $error = $exception_prefix.$error;
+    }
+    return $self->next::method($error, @_);
 }
 
 =head1 CAVEATS

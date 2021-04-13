@@ -30,6 +30,12 @@ my $schema = CDTest->init_schema(
 );
 my $storage = $schema->storage;
 
+# Force jitter off to remove randomness from tests
+my $timer_opts = $storage->timer_options;
+$timer_opts->{jitter_factor}         = 0;
+$timer_opts->{timeout_jitter_factor} = 0;
+$storage->_reset_retryable_timeout;
+
 # The SQL and the lack of a real database doesn't really matter, since the sole purpose
 # of this engine is to handle certain exceptions and react to them.  However,
 # running this with a proper MySQL CDTEST_DSN would grant some additional $dbh checks.
@@ -110,7 +116,7 @@ sub run_update_test {
     my %args = @_;
 
     # Defaults
-    $args{duration} //= 0;   # assume complete success
+    $args{duration} //= $EXEC_SLEEP_TIME;   # assume complete success
     $args{attempts} //= 1;
     $args{timeout}  //= 25;  # half of 50s timeout
 
@@ -143,7 +149,7 @@ sub run_update_test {
 
         # Always add two seconds for lag and code runtimes
         my $duration = time - $start_time;
-        note sprintf "Duration: %.2f seconds (range: %u-%u)", $duration, $args{duration}, $args{duration} + 2;
+        note sprintf "Duration: %.2f seconds (range: %.2f - %.2f)", $duration, $args{duration}, $args{duration} + 2;
         cmp_ok $duration, '>=', $args{duration},     'expected duration (>=)';
         cmp_ok $duration, '<=', $args{duration} + 2, 'expected duration (<=)';
 
@@ -184,6 +190,7 @@ subtest 'clean_test_with_retryable_timeout' => sub {
     local $EXEC_COUNTER    = 0;
     local $EXEC_SUCCESS_AT = 1;
 
+    # Purposely using legacy attribute shims for testing
     $storage->retryable_timeout(50);
 
     run_update_test;
@@ -206,7 +213,12 @@ subtest 'recoverable_failures' => sub {
     local $EXEC_COUNTER    = 0;
 
     run_update_test(
-        duration => 1.41 + 2 + 2.83,  # hitting minimum exponential timeouts each time
+        duration => $EXEC_SUCCESS_AT * $EXEC_SLEEP_TIME + (
+            # hitting minimum exponential timer sleeps each time
+            (1.41 - $EXEC_SLEEP_TIME) +
+            (2.00 - $EXEC_SLEEP_TIME) +
+            (2.83 - $EXEC_SLEEP_TIME)
+        ),
         attempts => $EXEC_SUCCESS_AT,
     );
 };
@@ -264,7 +276,7 @@ subtest 'non_retryable_failure' => sub {
     run_update_test(
         duration  => 2 * $EXEC_SLEEP_TIME,
         attempts  => 2,
-        exception => qr/Duplicate entry .+ for key/,
+        exception => qr<Failed dbh_do coderef: Exception not transient, attempts: 2 / 8, timer: [\d\.]+ / 0.0 sec, last exception:.+DBI Exception: DBD::mysql::st execute failed: Duplicate entry .+ for key>,
     );
 };
 
@@ -273,30 +285,31 @@ subtest 'ran_out_of_attempts' => sub {
     local $EXEC_SUCCESS_AT = 8;
     local $EXEC_SLEEP_TIME = 2;
 
+    # Purposely using legacy attribute shims for testing
     $storage->max_attempts(4);
 
     run_update_test(
-        duration  => 4 * $EXEC_SLEEP_TIME,
+        duration  => 4 * $EXEC_SLEEP_TIME + 0.8,  # ~0.82s sleep on the 4th attempt
         attempts  => 4,
-        exception => qr/Reached max_attempts amount of 4, latest exception:.+DBI Exception: DBD::mysql::st execute failed: Lost connection to MySQL server during query/,
+        exception => qr<Failed dbh_do coderef: Out of retries, attempts: 5 / 4, timer: [\d\.]+ / 0.0 sec, last exception:.+DBI Exception: DBD::mysql::st execute failed: Lost connection to MySQL server during query>,
     );
 
     $storage->max_attempts(8);
 };
 
-subtest 'recoverable_failures_with_retryable_timeout' => sub {
+subtest 'recoverable_failures_with_timeouts' => sub {
     local $EXEC_COUNTER    = 0;
     local $EXEC_SLEEP_TIME = 2;
 
-    $storage->retryable_timeout(20);
+    $timer_opts->{max_actual_duration} = 20;
 
     run_update_test(
-        duration => $EXEC_SUCCESS_AT * $EXEC_SLEEP_TIME,
+        duration => $EXEC_SUCCESS_AT * $EXEC_SLEEP_TIME + 0.8,  # ~0.82s sleep on the 4th attempt
         attempts => $EXEC_SUCCESS_AT,
         timeout  => 10,  # half of 20s timeout
     );
 
-    $storage->retryable_timeout(0);
+    $timer_opts->{max_actual_duration} = 0;
 };
 
 subtest 'ran_out_of_time' => sub {
@@ -304,16 +317,16 @@ subtest 'ran_out_of_time' => sub {
     local $EXEC_SUCCESS_AT = 8;
     local $EXEC_SLEEP_TIME = 5;
 
-    $storage->retryable_timeout(22);
+    $timer_opts->{max_actual_duration} = 22;
 
     run_update_test(
-        duration  => 25,  # should get a 5s timeout after the fourth attempt
+        duration  => 5 * $EXEC_SLEEP_TIME,
         attempts  => 5,
         timeout   => 11,  # half of 22s timeout
-        exception => qr/DBI Exception: DBD::mysql::st execute failed: WSREP has not yet prepared node for application use/,
+        exception => qr<Failed dbh_do coderef: Out of retries, attempts: 5 / 8, timer: [\d\.]+ / 22.0 sec, last exception:.+DBI Exception: DBD::mysql::st execute failed: WSREP has not yet prepared node for application use>,
     );
 
-    $storage->retryable_timeout(0);
+    $timer_opts->{max_actual_duration} = 0;
 };
 
 subtest 'failure_with_disable_retryable' => sub {
@@ -326,7 +339,7 @@ subtest 'failure_with_disable_retryable' => sub {
     run_update_test(
         duration  => 5,
         attempts  => 1,
-        exception => qr/DBI Exception: DBD::mysql::st execute failed: Deadlock found when trying to get lock; try restarting transaction/,
+        exception => qr<DBI Exception: DBD::mysql::st execute failed: Deadlock found when trying to get lock; try restarting transaction>,
     );
 
     $storage->disable_retryable(0);
@@ -339,7 +352,7 @@ subtest 'aggressive_timeouts_off' => sub {
     local $EXEC_UPDATE_SQL = 'SELECT SLEEP(17)';
     local $EXEC_ACTUALLY_EXECUTE = 1;
 
-    $storage->retryable_timeout(22);
+    $timer_opts->{max_actual_duration} = 22;
     $storage->aggressive_timeouts(0);
 
     run_update_test(
@@ -348,7 +361,7 @@ subtest 'aggressive_timeouts_off' => sub {
         timeout   => 11,  # half of 22s timeout
     );
 
-    $storage->retryable_timeout(0);
+    $timer_opts->{max_actual_duration} = 0;
     $storage->aggressive_timeouts(0);
 };
 
@@ -359,17 +372,17 @@ subtest 'aggressive_timeouts_on' => sub {
     local $EXEC_UPDATE_SQL = 'SELECT SLEEP(17)';
     local $EXEC_ACTUALLY_EXECUTE = 1;
 
-    $storage->retryable_timeout(22);
+    $timer_opts->{max_actual_duration} = 22;
     $storage->aggressive_timeouts(1);
 
     run_update_test(
-        duration  => 11 + 1.41 + 5 + 2 + 5,  # should get a 5s timeout after the fourth attempt
+        duration  => 11 + 5 + 5 + 5,
         attempts  => 4,
         timeout   => 11,  # half of 22s timeout
-        exception => qr/DBI Exception: DBD::mysql::st execute failed: Lost connection to MySQL server during query/,
+        exception => qr<Failed dbh_do coderef: Out of retries, attempts: 4 / 8, timer: [\d\.]+ / 22.0 sec, last exception:.+DBI Exception: DBD::mysql::db do failed: MySQL server has gone away>,
     );
 
-    $storage->retryable_timeout(0);
+    $timer_opts->{max_actual_duration} = 0;
     $storage->aggressive_timeouts(0);
 };
 
