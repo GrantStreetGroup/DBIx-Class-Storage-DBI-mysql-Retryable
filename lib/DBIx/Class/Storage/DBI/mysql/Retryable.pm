@@ -17,6 +17,64 @@ use namespace::clean;
 # ABSTRACT: MySQL-specific DBIC storage engine with retry support
 # VERSION
 
+=head1 SYNOPSIS
+
+    package MySchema;
+
+    # Recommended
+    DBIx::Class::Storage::DBI::mysql::Retryable->_use_join_optimizer(0);
+
+    __PACKAGE__->storage_type('::DBI::mysql::Retryable');
+
+    # Optional settings (defaults shown)
+    my $storage_class = 'DBIx::Class::Storage::DBI::mysql::Retryable';
+    $storage_class->parse_error_class('DBIx::ParseError::MySQL');
+    $storage_class->timer_class('Algorithm::Backoff::RetryTimeouts');
+    $storage_class->timer_options({});           # same defaults as the timer class
+    $storage_class->aggressive_timeouts(0);
+    $storage_class->warn_on_retryable_error(0);
+    $storage_class->disable_retryable(0);
+
+=head1 DESCRIPTION
+
+This storage engine for L<DBIx::Class> is a MySQL-specific engine that will explicitly
+retry on MySQL-specific transient error messages, as identified by L<DBIx::ParseError::MySQL>,
+using L<Algorithm::Backoff::RetryTimeouts> as its retry algorithm.  This engine should be
+much better at handling deadlocks, connection errors, and Galera node flips to ensure the
+transaction always goes through.
+
+=head2 How Retryable Works
+
+A DBIC command triggers some sort of connection to the MySQL server to send SQL.  First,
+Retryable makes sure the connection C<mysql_*_timeout> values (except C<mysql_read_timeout>
+unless L</aggressive_timeouts> is set) are set properly.  (The default settings for
+L<RetryTimeouts|Algorithm::Backoff::RetryTimeouts/Typical scenario> will use half of the
+maximum duration, with some jitter.)  If the connection was successful, a few C<SET SESSION>
+commands for timeouts are sent first:
+
+    wait_timeout   # only with aggressive_timeouts=1
+    lock_wait_timeout
+    innodb_lock_wait_timeout
+    net_read_timeout
+    net_write_timeout
+
+If the DBIC command fails at any point in the process, and the error is a recoverable
+failure (according to the L<error parsing class|DBIx::ParseError::MySQL>), the retry
+process starts.
+
+The timeouts are only checked during the retry handler.  Since DB operations are XS
+calls, Perl-style "safe" ALRM signals won't do any good, and the engine won't attempt to
+use unsafe ones.  Thus, the engine relies on the server to honor the timeouts set during
+each attempt, and will give up if it runs out of time or attempts.
+
+If the DBIC command succeeds during the process, program flow resumes as normal.  If any
+re-attempts happened during the DBIC command, the timeouts are reset back to the original
+post-connection values.
+
+=head1 STORAGE OPTIONS
+
+=cut
+
 __PACKAGE__->mk_group_accessors('inherited' => qw<
     parse_error_class timer_class
     timer_options aggressive_timeouts
@@ -36,120 +94,28 @@ __PACKAGE__->aggressive_timeouts(0);
 __PACKAGE__->warn_on_retryable_error(0);
 __PACKAGE__->disable_retryable(0);
 
-=head1 SYNOPSIS
+=head2 parse_error_class
 
-    package MySchema;
+Class used to parse MySQL error messages.
 
-    # Recommended
-    DBIx::Class::Storage::DBI::mysql::Retryable->_use_join_optimizer(0);
+Default is L<DBIx::ParseError::MySQL>.  If a different class is used, it must support a
+similar interface, especially the L<C<is_transient>|DBIx::ParseError::MySQL/is_transient>
+method.
 
-    __PACKAGE__->storage_type('::DBI::mysql::Retryable');
+=head2 timer_class
 
-    # Optional settings
-    my $storage_class = 'DBIx::Class::Storage::DBI::mysql::Retryable';
-    $storage_class->parse_error_class('DBIx::ParseError::MySQL');
-    $storage_class->timer_class('Algorithm::Backoff::RetryTimeouts');
-    $storage_class->timer_options({});           # same defaults as the timer class
-    $storage_class->aggressive_timeouts(0);      # default
-    $storage_class->warn_on_retryable_error(0);  # default
-    $storage_class->disable_retryable(0);        # default
+Algorithm class used to determine timeout and sleep values during the retry process.
 
-=head1 DESCRIPTION
+Default is L<Algorithm::Backoff::RetryTimeouts>.  If a different class is used, it must
+support a similar interface, including the dual return of the L<C<failure>|Algorithm::Backoff::RetryTimeouts/failure>
+method.
 
-This storage engine for L<DBIx::Class> is a MySQL-specific engine that implements better
-retry support, based on common retryable MySQL errors.  This engine should be much better
-at handling deadlocks, connection errors, and Galera node flips to ensure the transaction
-always goes through.
+=head2 timer_options
 
-=head2 How Retryable Works
+Options to pass to the timer algorithm constructor, as a hashref.
 
-=head3 Without retryable_timeout
-
-A DBIC command triggers some sort of connection to the MySQL server to send SQL.  If that
-fails at any point in the process, and the error is a recoverable failure (deadlocks,
-connection failures, etc.), the retry process starts:
-
-    Die if connected and error is not retryable
-
-    Warn about error if warn_on_retryable_error is on
-
-    S = 2 ** (A/2) seconds (A=Attempt count)
-        (ie: 1.4, 2, 2.8, 4, 5.7, 8, etc.)
-
-    If the last attempt (LAS) took under S seconds:
-        Sleep for S-LAS seconds
-
-    Force disconnection of database handle
-
-    Retry and repeat, stopping on max_attempts
-
-=head3 With retryable_timeout
-
-A DBIC command triggers some sort of connection to the MySQL server to send SQL.  First,
-Retryable makes sure the connection C<mysql_*_timeout> values (except C<mysql_read_timeout>
-unless L</aggressive_timeouts> is set) are set to one-half of the L</retryable_timeout>
-setting ("R").  If the connection was successful, a few C<SET SESSION> commands for
-timeouts are sent first:
-
-    wait_timeout   # only with aggressive_timeouts=1
-    lock_wait_timeout
-    innodb_lock_wait_timeout
-    net_read_timeout
-    net_write_timeout
-
-These are all set to C<R/2> as well.  If the DBIC command fails at any point in the
-process, and the error is a recoverable failure (deadlocks, connection failures, etc.),
-the retry process starts:
-
-    Die if connected and error is not retryable
-
-    Warn about error if warn_on_retryable_error is on
-
-    Calculate the time left (T), based on R and the first attempt time
-
-    Die if we're out of time
-
-    S = 2 ** (A/2) seconds (A=Attempt count)
-        (ie: 1.4, 2, 2.8, 4, 5.7, 8, etc.)
-
-    If the last attempt (LAS) took under S seconds:
-        Sleep for S-LAS or T/2 seconds, whichever is smaller
-        T is readjusted
-
-    Force disconnection of database handle
-
-    Re-connection will use T/2 or 5 seconds for timeouts, whichever is larger
-        (This includes SET SESSION commands.)
-
-    Retry and repeat, stopping on max_attempts
-
-If any re-attempts happened during the DBIC command, the timeouts are reset back to
-C<R/2>.
-
-=head1 STORAGE OPTIONS
-
-=head2 max_attempts
-
-Number of re-connection attempts before L<DBIx::Class::Storage::BlockRunner> gives up and
-dies with the last error.  If the response was quick, each attempt will sleep for
-C<< 2 ** (A/2) >> seconds (ie: 1.4, 2, 2.8, 4, etc.) to give the DB a chance to clear its
-error.
-
-Default is 8, which would have a total exponential backoff period of 51.2 seconds, for
-quick errors.
-
-=head2 retryable_timeout
-
-Timeout value set to time the entire duration of a DB transaction, including retries.
-This is different than the usual timeout values for MySQL that only affect the connection
-or a single try.
-
-The timeouts are only checked during the retry handler.  Since the DB operations are XS
-calls, Perl-style "safe" ALRM signals won't do any good, and the engine won't attempt to
-use unsafe ones.  However, it will auto-adjust MySQL timeouts based on how much time it
-has left.
-
-Default is off.
+Default is an empty hashref, which would retain all of the defaults of the algorithm
+module.
 
 =head2 aggressive_timeouts
 
@@ -396,8 +362,6 @@ retryable failures.
 
 However, this method is recommended over using C<< $schema->storage->dbh >> directly to
 run raw SQL statements.
-
-See also: L<DBIx::Class::Storage::BlockRunner>.
 
 =cut
 
@@ -655,6 +619,12 @@ C<< $storage->dbh >>.
 
 Instead, use L</dbh_do>.  This method is also used by DBIC for most of its active DB
 calls, after it has composed a proper SQL statement to run.
+
+=head1 SEE ALSO
+
+L<DBIx::Connector::Retry::MySQL> - A similar engine for DBI connections, using L<DBIx::Connector::Retry> as a base.
+
+L<DBIx::Class::Storage::BlockRunner> - Base module in DBIC that controls how transactional coderefs are ran and retried
 
 =cut
 
