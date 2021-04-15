@@ -441,9 +441,11 @@ sub _blockrunner_retry_handler {
         $self->_set_dbi_connect_info;
     }
 
-    # Force a disconnect
+    # Force a disconnect, but only if the connection seems to be in a broken state
     local $@;
-    eval { local $SIG{__DIE__}; $self->disconnect };
+    unless ($parsed_error->error_type eq 'lock') {
+        eval { local $SIG{__DIE__}; $self->disconnect };
+    }
 
     # Because BlockRunner calls this unprotected, and because our own _connect is going
     # to hit the _in_do_block short-circuit, we should call this ourselves, in a
