@@ -170,6 +170,7 @@ sub run_update_test {
             >;
 
             skip "Aggressive timeouts are not on in this test", 2 unless $storage->aggressive_timeouts;
+            skip "Can't use aggressive timeouts on this version of DBD::mysql", 2 if $DBD::mysql::VERSION < 4.023;
 
             is $connect_attrs->{$_}, $args{timeout}, "$_ (attr) was reset" for ('mysql_read_timeout');
             is $timeout_vars->{$_}{Value}, $args{timeout}, "$_ (session var) was reset" for ('wait_timeout');
