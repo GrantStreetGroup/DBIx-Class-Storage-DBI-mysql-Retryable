@@ -7,7 +7,7 @@ requires 'DBIx::ParseError::MySQL';
 requires 'namespace::clean';
 
 # Indirect (or bundled) requirements
-requires 'DBI';
+requires 'DBI', '1.630';
 requires 'DBD::mysql';
 requires 'DBIx::Class';
 

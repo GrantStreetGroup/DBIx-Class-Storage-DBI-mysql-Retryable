@@ -23,22 +23,17 @@ CDTest::Schema->storage_type('::DBI::mysql::Retryable');
 ### DEBUG
 #DBIx::Class::Storage::DBI::mysql::Retryable->warn_on_retryable_error(1);
 
-my $schema = CDTest->init_schema(
-    no_deploy   => 1,
-    no_preclean => 1,
-    no_populate => 1,
-);
-my $storage = $schema->storage;
-
-# Force jitter off to remove randomness from tests
-my $timer_opts = $storage->timer_options;
-$timer_opts->{jitter_factor}         = 0;
-$timer_opts->{timeout_jitter_factor} = 0;
-$storage->_reset_retryable_timeout;
-
 # The SQL and the lack of a real database doesn't really matter, since the sole purpose
 # of this engine is to handle certain exceptions and react to them.  However,
 # running this with a proper MySQL CDTEST_DSN would grant some additional $dbh checks.
+#
+# To specify a MySQL DB, you'll need a call like:
+#
+# CDTEST_DSN='dbi:mysql:database=...;host=...' CDTEST_DBUSER=... CDTEST_DBPASS=... prove -lrv t
+#
+# It will then use that database, instead of a default SQLite one.  Make sure the
+# database doesn't have any useful data in it.  The database must exist prior to running
+# the test.
 
 our $EXEC_COUNTER    = 0;
 our $EXEC_SUCCESS_AT = 4;
@@ -55,6 +50,8 @@ our $EXEC_UPDATE_SQL = 'SELECT 1';
 our $EXEC_ACTUALLY_EXECUTE = 0;
 
 our $UPDATE_FAILED = 0;
+
+our $IS_MYSQL = $CDTEST_DSN && $CDTEST_DSN =~ /^dbi:mysql:/;
 
 no warnings 'redefine';
 *DBIx::Class::Storage::DBI::_dbh_execute = sub {
@@ -91,6 +88,26 @@ no warnings 'redefine';
     $UPDATE_FAILED = 0;
     return (wantarray ? ($rv, $sth, @$bind) : $rv);
 };
+
+my $orig_do = \&DBI::db::do;
+*DBI::db::do = sub {
+    my $sql = $_[1];
+
+    # Ignore override for MySQL
+    return $orig_do->(@_) if $IS_MYSQL;
+
+    # If it's a sleep function, emulate it
+    if ($sql =~ /SELECT SLEEP\((\d+)\)/) {
+        sleep $1;
+        return "0E0";
+    }
+
+    # Pretend it worked if it's a SET statement
+    return "0E0" if $sql =~ /^SET /;
+
+    # Otherwise, continue with the original 'do' method
+    return $orig_do->(@_) ;
+};
 use warnings 'redefine';
 
 my $orig__connect = \&DBIx::Class::Storage::DBI::_connect;
@@ -112,6 +129,19 @@ sub __connect_test {
     return $orig__connect->($self);
 }
 
+my $schema = CDTest->init_schema(
+    no_deploy   => 1,
+    no_preclean => 1,
+    no_populate => 1,
+);
+my $storage = $schema->storage;
+
+# Force jitter off to remove randomness from tests
+my $timer_opts = $storage->timer_options;
+$timer_opts->{jitter_factor}         = 0;
+$timer_opts->{timeout_jitter_factor} = 0;
+$storage->_reset_retryable_timeout;
+
 sub run_update_test {
     my %args = @_;
 
@@ -123,7 +153,7 @@ sub run_update_test {
     SKIP: {
         # SQLite does not recognize SET SESSION commands
         skip "CDTEST_DSN not set to a MySQL DB for a retryable_timeout test", 12
-            if $storage->retryable_timeout && !($CDTEST_DSN && $CDTEST_DSN =~ /^dbi:mysql:/);
+            if $storage->retryable_timeout && !$IS_MYSQL;
 
         # Changing storage variables may require some resetting
         $storage->connect_info( $storage->_connect_info );
@@ -156,7 +186,7 @@ sub run_update_test {
         is $EXEC_COUNTER,      $args{attempts}, 'expected attempts counter';
 
         SKIP: {
-            skip "CDTEST_DSN not set to a MySQL DB",           8 unless $CDTEST_DSN && $CDTEST_DSN =~ /^dbi:mysql:/;
+            skip "CDTEST_DSN not set to a MySQL DB",           8 unless $IS_MYSQL;
             skip "Retryable timeouts are not on in this test", 8 unless $storage->retryable_timeout;
             skip "Retryable is disabled",                      8 if     $storage->disable_retryable;
 

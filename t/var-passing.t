@@ -20,12 +20,7 @@ use CDTest;
 
 CDTest::Schema->storage_type('::DBI::mysql::Retryable');
 
-my $schema = CDTest->init_schema(
-    no_deploy   => 1,
-    no_preclean => 1,
-    no_populate => 1,
-);
-my $storage = $schema->storage;
+our $IS_MYSQL = $CDTEST_DSN && $CDTEST_DSN =~ /^dbi:mysql:/;
 
 my %isa_checks = (
     dbh_do => [qw<
@@ -65,6 +60,27 @@ my $orig__connect = \&DBIx::Class::Storage::DBI::_connect;
     return $orig__connect->($self);
 };
 
+my $orig_do = \&DBI::db::do;
+*DBI::db::do = sub {
+    my $sql = $_[1];
+
+    # Ignore override for MySQL
+    return $orig_do->(@_) if $IS_MYSQL;
+
+    # If it's a sleep function, emulate it
+    if ($sql =~ /SELECT SLEEP\((\d+)\)/) {
+        sleep $1;
+        return "0E0";
+    }
+
+    # Pretend it worked if it's a SET statement
+    return "0E0" if $sql =~ /^SET /;
+
+    # Otherwise, continue with the original 'do' method
+    return $orig_do->(@_) ;
+};
+
+no warnings 'once';
 *CDTest::Schema::Result::Track::test_dbh_do_vars = sub {
     return $_[0]->result_source->schema->storage->dbh_do(
         sub {
@@ -89,6 +105,13 @@ my $orig__connect = \&DBIx::Class::Storage::DBI::_connect;
     );
 };
 use warnings 'redefine';
+
+my $schema = CDTest->init_schema(
+    no_deploy   => 1,
+    no_preclean => 1,
+    no_populate => 1,
+);
+my $storage = $schema->storage;
 
 my $result = $schema->resultset('Track')->new_result({ trackid => 999 });
 

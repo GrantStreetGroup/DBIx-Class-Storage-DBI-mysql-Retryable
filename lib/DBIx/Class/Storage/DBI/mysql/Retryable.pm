@@ -3,6 +3,7 @@ package DBIx::Class::Storage::DBI::mysql::Retryable;
 use strict;
 use warnings;
 
+use DBI '1.630';
 use base qw< DBIx::Class::Storage::DBI::mysql >;
 
 use Algorithm::Backoff::RetryTimeouts;
