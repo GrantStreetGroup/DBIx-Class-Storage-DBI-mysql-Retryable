@@ -34,7 +34,7 @@ use namespace::clean;
     $storage_class->timer_options({});           # same defaults as the timer class
     $storage_class->aggressive_timeouts(0);
     $storage_class->warn_on_retryable_error(0);
-    $storage_class->disable_retryable(0);
+    $storage_class->enable_retryable(1);
 
 =head1 DESCRIPTION
 
@@ -79,7 +79,7 @@ post-connection values.
 __PACKAGE__->mk_group_accessors('inherited' => qw<
     parse_error_class timer_class
     timer_options aggressive_timeouts
-    warn_on_retryable_error disable_retryable
+    warn_on_retryable_error enable_retryable
 >);
 
 __PACKAGE__->mk_group_accessors('simple' => qw<
@@ -93,7 +93,7 @@ __PACKAGE__->timer_class('Algorithm::Backoff::RetryTimeouts');
 __PACKAGE__->timer_options({});
 __PACKAGE__->aggressive_timeouts(0);
 __PACKAGE__->warn_on_retryable_error(0);
-__PACKAGE__->disable_retryable(0);
+__PACKAGE__->enable_retryable(1);
 
 =head2 parse_error_class
 
@@ -161,15 +161,15 @@ is already the DBIC-required default, the former option can't be used within DBI
 
 Default is off.
 
-=head2 disable_retryable
+=head2 enable_retryable
 
-Boolean to temporarily disable the Retryable logic, and revert to DBIC's basic "retry
-once if disconnected" default.  This may be useful if a process is already using some
-other retry logic (like L<DBIx::OnlineDDL>).
+Boolean that enables the Retryable logic.  This can be turned off to temporarily disable
+it, and revert to DBIC's basic "retry once if disconnected" default.  This may be useful
+if a process is already using some other retry logic (like L<DBIx::OnlineDDL>).
 
 Messing with this setting in the middle of a database action would not be wise.
 
-Default is off.
+Default is (obviously) on.
 
 =cut
 
@@ -189,6 +189,12 @@ sub retryable_timeout {
 
     return $opts->{max_actual_duration} = $_[0] if @_;
     return $opts->{max_actual_duration} // 50;
+}
+
+sub disable_retryable {
+    my $self = shift;
+    $self->enable_retryable( $_[0] ? 0 : 1 ) if @_;
+    return $self->enable_retryable ? 0 : 1;
 }
 
 =head1 METHODS
@@ -250,7 +256,7 @@ sub _timeout_set_list {
 # attributes.
 sub _default_dbi_connect_attributes () {
     my $self = shift;
-    return $self->next::method unless $self->_retryable_current_timeout && !$self->disable_retryable;
+    return $self->next::method unless $self->_retryable_current_timeout && $self->enable_retryable;
 
     my $timeout = int( $self->_retryable_current_timeout + 0.5 );
 
@@ -265,7 +271,7 @@ sub _default_dbi_connect_attributes () {
 # connection by the retry handling.
 sub _set_dbi_connect_info {
     my $self = shift;
-    return unless $self->_retryable_current_timeout && !$self->disable_retryable;
+    return unless $self->_retryable_current_timeout && $self->enable_retryable;
 
     my $timeout = int( $self->_retryable_current_timeout + 0.5 );
 
@@ -307,7 +313,7 @@ sub _run_connection_actions {
 
 sub _set_retryable_session_timeouts {
     my $self = shift;
-    return unless $self->_retryable_current_timeout && !$self->disable_retryable;
+    return unless $self->_retryable_current_timeout && $self->enable_retryable;
 
     my $timeout = int( $self->_retryable_current_timeout + 0.5 );
 
@@ -338,7 +344,7 @@ sub _set_retryable_session_timeouts {
 # Make sure the initial connection call is protected from retryable failures
 sub _connect {
     my $self = shift;
-    return $self->next::method() if $self->disable_retryable;
+    return $self->next::method() unless $self->enable_retryable;
     # next::can here to do mro calculations prior to sending to _blockrunner_do
     return $self->_blockrunner_do( connect => $self->next::can() );
 }
@@ -462,7 +468,7 @@ sub _blockrunner_retry_handler {
 
 sub dbh_do {
     my $self = shift;
-    return $self->next::method(@_) if $self->disable_retryable;
+    return $self->next::method(@_) unless $self->enable_retryable;
     return $self->_blockrunner_do( dbh_do => @_ );
 }
 
@@ -484,7 +490,7 @@ Calling this method through the C<$schema> object is typically more convenient.
 
 sub txn_do {
     my $self = shift;
-    return $self->next::method(@_) if $self->disable_retryable;
+    return $self->next::method(@_) unless $self->enable_retryable;
 
     # Connects or reconnects on pid change to grab correct txn_depth (same as
     # DBIx::Class::Storage::DBI)
