@@ -329,9 +329,13 @@ sub _set_retryable_session_timeouts {
             $dbh->do("SET SESSION $_=$timeout") for $self->_timeout_set_list('session');
         }
     };
-    if (my $error = $@) {
-        my $parsed_error = $self->parse_error_class->new($error);
-        die unless $parsed_error->is_transient;  # bare die for $@ propagation
+    # Protect $@ again, just in case the parser class does something inappropriate
+    # with a blessed $error
+    if ( my $error = $@ ) {
+        die unless do { # bare die for $@ propagation
+            local $@;
+            $self->parse_error_class->new($error)->is_transient;
+        };
 
         # The error may have been transient, but we might have ran out of retries, anyway
         my $str_error = "$error";
