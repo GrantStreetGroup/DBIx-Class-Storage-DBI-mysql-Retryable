@@ -338,8 +338,7 @@ sub _set_retryable_session_timeouts {
         };
 
         # The error may have been transient, but we might have ran out of retries, anyway
-        my $str_error = "$error";
-        die if $str_error =~ m<Failed \w+ coderef: .+, attempts: \d+ / \d+, timer: [\d\.]+ / [\d\.]+ sec, last exception: >;
+        die if $error =~ m<Failed \w+ coderef: .+, attempts: \d+ / \d+, timer: [\d\.]+ / [\d\.]+ sec, last exception: >;
 
         warn "Encountered a recoverable error during SET SESSION timeout commands: $error" if $self->warn_on_retryable_error;
     }
