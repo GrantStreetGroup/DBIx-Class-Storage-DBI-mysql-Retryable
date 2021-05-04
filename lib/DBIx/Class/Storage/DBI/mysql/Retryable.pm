@@ -3,33 +3,20 @@ package DBIx::Class::Storage::DBI::mysql::Retryable;
 use strict;
 use warnings;
 
+use DBI '1.630';
 use base qw< DBIx::Class::Storage::DBI::mysql >;
 
+use Algorithm::Backoff::RetryTimeouts;
 use Context::Preserve;
-use List::Util  qw< min max >;
-use POSIX       qw< floor >;
-use Time::HiRes qw< time sleep >;
+use DBIx::ParseError::MySQL;
+use List::Util   qw< min max >;
+use Scalar::Util qw< blessed >;
+use Storable     qw< dclone >;
+use Time::HiRes  qw< time sleep >;
 use namespace::clean;
 
 # ABSTRACT: MySQL-specific DBIC storage engine with retry support
 # VERSION
-
-__PACKAGE__->mk_group_accessors('inherited' => qw<
-    max_attempts retryable_timeout aggressive_timeouts
-    warn_on_retryable_error disable_retryable
->);
-
-__PACKAGE__->mk_group_accessors('simple' => qw<
-    _retryable_first_attempt_time _retryable_last_attempt_time
-    _retryable_current_timeout
->);
-
-# Set defaults
-__PACKAGE__->max_attempts(8);
-__PACKAGE__->retryable_timeout(0);
-__PACKAGE__->aggressive_timeouts(0);
-__PACKAGE__->warn_on_retryable_error(0);
-__PACKAGE__->disable_retryable(0);
 
 =head1 SYNOPSIS
 
@@ -40,50 +27,31 @@ __PACKAGE__->disable_retryable(0);
 
     __PACKAGE__->storage_type('::DBI::mysql::Retryable');
 
-    # Optional settings
+    # Optional settings (defaults shown)
     my $storage_class = 'DBIx::Class::Storage::DBI::mysql::Retryable';
-    $storage_class->max_attempts(8);             # default
-    $storage_class->retryable_timeout(50);       # default is 0 (off)
-    $storage_class->aggressive_timeouts(0);      # default
-    $storage_class->warn_on_retryable_error(0);  # default
-    $storage_class->disable_retryable(0);        # default
+    $storage_class->parse_error_class('DBIx::ParseError::MySQL');
+    $storage_class->timer_class('Algorithm::Backoff::RetryTimeouts');
+    $storage_class->timer_options({});           # same defaults as the timer class
+    $storage_class->aggressive_timeouts(0);
+    $storage_class->warn_on_retryable_error(0);
+    $storage_class->enable_retryable(1);
 
 =head1 DESCRIPTION
 
-This storage engine for L<DBIx::Class> is a MySQL-specific engine that implements better
-retry support, based on common retryable MySQL errors.  This engine should be much better
-at handling deadlocks, connection errors, and Galera node flips to ensure the transaction
-always goes through.
+This storage engine for L<DBIx::Class> is a MySQL-specific engine that will explicitly
+retry on MySQL-specific transient error messages, as identified by L<DBIx::ParseError::MySQL>,
+using L<Algorithm::Backoff::RetryTimeouts> as its retry algorithm.  This engine should be
+much better at handling deadlocks, connection errors, and Galera node flips to ensure the
+transaction always goes through.
 
 =head2 How Retryable Works
 
-=head3 Without retryable_timeout
-
-A DBIC command triggers some sort of connection to the MySQL server to send SQL.  If that
-fails at any point in the process, and the error is a recoverable failure (deadlocks,
-connection failures, etc.), the retry process starts:
-
-    Die if connected and error is not retryable
-
-    Warn about error if warn_on_retryable_error is on
-
-    S = 2 ** (A/2) seconds (A=Attempt count)
-        (ie: 1.4, 2, 2.8, 4, 5.7, 8, etc.)
-
-    If the last attempt (LAS) took under S seconds:
-        Sleep for S-LAS seconds
-
-    Force disconnection of database handle
-
-    Retry and repeat, stopping on max_attempts
-
-=head3 With retryable_timeout
-
 A DBIC command triggers some sort of connection to the MySQL server to send SQL.  First,
 Retryable makes sure the connection C<mysql_*_timeout> values (except C<mysql_read_timeout>
-unless L</aggressive_timeouts> is set) are set to one-half of the L</retryable_timeout>
-setting ("R").  If the connection was successful, a few C<SET SESSION> commands for
-timeouts are sent first:
+unless L</aggressive_timeouts> is set) are set properly.  (The default settings for
+L<RetryTimeouts|Algorithm::Backoff::RetryTimeouts/Typical scenario> will use half of the
+maximum duration, with some jitter.)  If the connection was successful, a few C<SET SESSION>
+commands for timeouts are sent first:
 
     wait_timeout   # only with aggressive_timeouts=1
     lock_wait_timeout
@@ -91,59 +59,64 @@ timeouts are sent first:
     net_read_timeout
     net_write_timeout
 
-These are all set to C<R/2> as well.  If the DBIC command fails at any point in the
-process, and the error is a recoverable failure (deadlocks, connection failures, etc.),
-the retry process starts:
+If the DBIC command fails at any point in the process, and the error is a recoverable
+failure (according to the L<error parsing class|DBIx::ParseError::MySQL>), the retry
+process starts.
 
-    Die if connected and error is not retryable
+The timeouts are only checked during the retry handler.  Since DB operations are XS
+calls, Perl-style "safe" ALRM signals won't do any good, and the engine won't attempt to
+use unsafe ones.  Thus, the engine relies on the server to honor the timeouts set during
+each attempt, and will give up if it runs out of time or attempts.
 
-    Warn about error if warn_on_retryable_error is on
-
-    Calculate the time left (T), based on R and the first attempt time
-
-    Die if we're out of time
-
-    S = 2 ** (A/2) seconds (A=Attempt count)
-        (ie: 1.4, 2, 2.8, 4, 5.7, 8, etc.)
-
-    If the last attempt (LAS) took under S seconds:
-        Sleep for S-LAS or T/2 seconds, whichever is smaller
-        T is readjusted
-
-    Force disconnection of database handle
-
-    Re-connection will use T/2 or 5 seconds for timeouts, whichever is larger
-        (This includes SET SESSION commands.)
-
-    Retry and repeat, stopping on max_attempts
-
-If any re-attempts happened during the DBIC command, the timeouts are reset back to
-C<R/2>.
+If the DBIC command succeeds during the process, program flow resumes as normal.  If any
+re-attempts happened during the DBIC command, the timeouts are reset back to the original
+post-connection values.
 
 =head1 STORAGE OPTIONS
 
-=head2 max_attempts
+=cut
 
-Number of re-connection attempts before L<DBIx::Class::Storage::BlockRunner> gives up and
-dies with the last error.  If the response was quick, each attempt will sleep for
-C<< 2 ** (A/2) >> seconds (ie: 1.4, 2, 2.8, 4, etc.) to give the DB a chance to clear its
-error.
+__PACKAGE__->mk_group_accessors('inherited' => qw<
+    parse_error_class timer_class
+    timer_options aggressive_timeouts
+    warn_on_retryable_error enable_retryable
+>);
 
-Default is 8, which would have a total exponential backoff period of 51.2 seconds, for
-quick errors.
+__PACKAGE__->mk_group_accessors('simple' => qw<
+    _retryable_timer _retryable_current_timeout
+    _retryable_call_type _retryable_exception_prefix
+>);
 
-=head2 retryable_timeout
+# Set defaults
+__PACKAGE__->parse_error_class('DBIx::ParseError::MySQL');
+__PACKAGE__->timer_class('Algorithm::Backoff::RetryTimeouts');
+__PACKAGE__->timer_options({});
+__PACKAGE__->aggressive_timeouts(0);
+__PACKAGE__->warn_on_retryable_error(0);
+__PACKAGE__->enable_retryable(1);
 
-Timeout value set to time the entire duration of a DB transaction, including retries.
-This is different than the usual timeout values for MySQL that only affect the connection
-or a single try.
+=head2 parse_error_class
 
-The timeouts are only checked during the retry handler.  Since the DB operations are XS
-calls, Perl-style "safe" ALRM signals won't do any good, and the engine won't attempt to
-use unsafe ones.  However, it will auto-adjust MySQL timeouts based on how much time it
-has left.
+Class used to parse MySQL error messages.
 
-Default is off.
+Default is L<DBIx::ParseError::MySQL>.  If a different class is used, it must support a
+similar interface, especially the L<C<is_transient>|DBIx::ParseError::MySQL/is_transient>
+method.
+
+=head2 timer_class
+
+Algorithm class used to determine timeout and sleep values during the retry process.
+
+Default is L<Algorithm::Backoff::RetryTimeouts>.  If a different class is used, it must
+support a similar interface, including the dual return of the L<C<failure>|Algorithm::Backoff::RetryTimeouts/failure>
+method.
+
+=head2 timer_options
+
+Options to pass to the timer algorithm constructor, as a hashref.
+
+Default is an empty hashref, which would retain all of the defaults of the algorithm
+module.
 
 =head2 aggressive_timeouts
 
@@ -188,19 +161,72 @@ is already the DBIC-required default, the former option can't be used within DBI
 
 Default is off.
 
-=head2 disable_retryable
+=head2 enable_retryable
 
-Boolean to temporarily disable the Retryable logic, and revert to DBIC's basic "retry
-once if disconnected" default.  This may be useful if a process is already using some
-other retry logic (like L<DBIx::OnlineDDL>).
+Boolean that enables the Retryable logic.  This can be turned off to temporarily disable
+it, and revert to DBIC's basic "retry once if disconnected" default.  This may be useful
+if a process is already using some other retry logic (like L<DBIx::OnlineDDL>).
 
 Messing with this setting in the middle of a database action would not be wise.
 
-Default is off.
+Default is (obviously) on.
+
+=cut
+
+### Backward-compatibility for legacy attributes
+
+sub max_attempts {
+    my $self = shift;
+    my $opts = $self->timer_options;
+
+    return $opts->{max_attempts} = $_[0] if @_;
+    return $opts->{max_attempts} // 8;
+}
+
+sub retryable_timeout {
+    my $self = shift;
+    my $opts = $self->timer_options;
+
+    return $opts->{max_actual_duration} = $_[0] if @_;
+    return $opts->{max_actual_duration} // 50;
+}
+
+sub disable_retryable {
+    my $self = shift;
+    $self->enable_retryable( $_[0] ? 0 : 1 ) if @_;
+    return $self->enable_retryable ? 0 : 1;
+}
 
 =head1 METHODS
 
 =cut
+
+sub _build_retryable_timer {
+    my $self = shift;
+    return $self->timer_class->new(
+        %{ dclone $self->timer_options }
+    );
+}
+
+sub _reset_retryable_timeout {
+    my $self = shift;
+
+    # Use a temporary timer to get the first timeout value
+    my $timeout = $self->_build_retryable_timer->timeout;
+    $timeout = 0 if $timeout == -1;
+    $self->_retryable_current_timeout($timeout);
+}
+
+sub _failed_attempt_count { shift->_retryable_timer->{_attempts} // 0 }
+
+# Constructor
+sub new {
+    my $self = shift->next::method(@_);
+
+    $self->_reset_retryable_timeout;
+
+    $self;
+}
 
 # Return the list of timeout strings to check
 sub _timeout_set_list {
@@ -230,15 +256,9 @@ sub _timeout_set_list {
 # attributes.
 sub _default_dbi_connect_attributes () {
     my $self = shift;
-    return $self->next::method unless $self->retryable_timeout && !$self->disable_retryable;
+    return $self->next::method unless $self->_retryable_current_timeout && $self->enable_retryable;
 
-    # Set the current timeout, if we need to.  This may be the case for the initial
-    # connection.
-    $self->_retryable_current_timeout(
-        $self->retryable_timeout / 2
-    ) unless $self->_retryable_current_timeout;
-
-    my $timeout = floor $self->_retryable_current_timeout;
+    my $timeout = int( $self->_retryable_current_timeout + 0.5 );
 
     return +{
         (map {; $_ => $timeout } $self->_timeout_set_list('dbi')),  # set timeouts
@@ -251,14 +271,9 @@ sub _default_dbi_connect_attributes () {
 # connection by the retry handling.
 sub _set_dbi_connect_info {
     my $self = shift;
-    return unless $self->retryable_timeout && !$self->disable_retryable;
+    return unless $self->_retryable_current_timeout && $self->enable_retryable;
 
-    # Set the current timeout, if we need to
-    $self->_retryable_current_timeout(
-        $self->retryable_timeout / 2
-    ) unless $self->_retryable_current_timeout;
-
-    my $timeout = floor $self->_retryable_current_timeout;
+    my $timeout = int( $self->_retryable_current_timeout + 0.5 );
 
     my $info = $self->_dbi_connect_info;
 
@@ -270,10 +285,10 @@ sub _set_dbi_connect_info {
 Your connect_info is a coderef, which means connection-based MySQL timeouts
 cannot be dynamically changed. Under certain conditions, the connection (or
 combination of connection attempts) may take longer to timeout than your
-current retryable_timeout setting.
+current timer settings.
 
 You'll want to revert to a 4-element style DBI argument set, to fully
-support the retryable_timeout functionality.
+support the timeout functionality.
 
 To disable this warning, set a true value to the environment variable
 DBIC_RETRYABLE_DONT_SET_CONNECT_SESSION_VARS
@@ -298,19 +313,14 @@ sub _run_connection_actions {
 
 sub _set_retryable_session_timeouts {
     my $self = shift;
-    return unless $self->retryable_timeout && !$self->disable_retryable;
+    return unless $self->_retryable_current_timeout && $self->enable_retryable;
 
-    # Set the current timeout, if we need to
-    $self->_retryable_current_timeout(
-        $self->retryable_timeout / 2
-    ) unless $self->_retryable_current_timeout;
-
-    my $timeout = floor $self->_retryable_current_timeout;
+    my $timeout = int( $self->_retryable_current_timeout + 0.5 );
 
     # Ironically, we aren't running our own SET SESSION commands with their own
     # BlockRunner protection, since that may lead to infinite stack recursion.  Instead,
-    # put it in a basic eval, and do a quick is_dbi_error_retryable check.  If it passes,
-    # let the next *_do/_do_query call handle it.
+    # put it in a basic eval, and do a quick is_transient check.  If it passes, let the
+    # next *_do/_do_query call handle it.
 
     local $@;
     eval {
@@ -319,8 +329,17 @@ sub _set_retryable_session_timeouts {
             $dbh->do("SET SESSION $_=$timeout") for $self->_timeout_set_list('session');
         }
     };
-    if (my $error = $@) {
-        die unless $self->is_dbi_error_retryable($error);  # bare die for $@ propagation
+    # Protect $@ again, just in case the parser class does something inappropriate
+    # with a blessed $error
+    if ( my $error = $@ ) {
+        die unless do { # bare die for $@ propagation
+            local $@;
+            $self->parse_error_class->new($error)->is_transient;
+        };
+
+        # The error may have been transient, but we might have ran out of retries, anyway
+        die if $error =~ m<Failed \w+ coderef: .+, attempts: \d+ / \d+, timer: [\d\.]+ / [\d\.]+ sec, last exception: >;
+
         warn "Encountered a recoverable error during SET SESSION timeout commands: $error" if $self->warn_on_retryable_error;
     }
 }
@@ -328,9 +347,9 @@ sub _set_retryable_session_timeouts {
 # Make sure the initial connection call is protected from retryable failures
 sub _connect {
     my $self = shift;
-    return $self->next::method() if $self->disable_retryable;
+    return $self->next::method() unless $self->enable_retryable;
     # next::can here to do mro calculations prior to sending to _blockrunner_do
-    return $self->_blockrunner_do( _connect => $self->next::can() );
+    return $self->_blockrunner_do( connect => $self->next::can() );
 }
 
 =head2 dbh_do
@@ -354,8 +373,6 @@ retryable failures.
 However, this method is recommended over using C<< $schema->storage->dbh >> directly to
 run raw SQL statements.
 
-See also: L<DBIx::Class::Storage::BlockRunner>.
-
 =cut
 
 # Main "doer" method for both dbh_do and txn_do
@@ -370,9 +387,9 @@ sub _blockrunner_do {
     my $target_runner = sub {
         # dbh_do and txn_do have different sub arguments, and _connect shouldn't
         # have a _get_dbh call.
-        if    ($call_type eq 'txn_do')   { $run_target->( @$args ); }
-        elsif ($call_type eq 'dbh_do')   { $self->$run_target( $self->_get_dbh, @$args ); }
-        elsif ($call_type eq '_connect') { $self->$run_target( @$args ); }
+        if    ($call_type eq 'txn_do')  { $run_target->( @$args ); }
+        elsif ($call_type eq 'dbh_do')  { $self->$run_target( $self->_get_dbh, @$args ); }
+        elsif ($call_type eq 'connect') { $self->$run_target( @$args ); }
         else { die "Unknown call type: $call_type" }
     };
 
@@ -381,24 +398,30 @@ sub _blockrunner_do {
 
     # Given our transaction depth short circuits, we should be at the outermost loop,
     # so it's safe to reset our variables.
-    my $epoch = time;
-    $self->_retryable_first_attempt_time($epoch);
-    $self->_retryable_last_attempt_time($epoch);
-    $self->_retryable_current_timeout( $self->retryable_timeout / 2 ) if $self->retryable_timeout;
+    $self->_retryable_timer( $self->_build_retryable_timer );
+
+    my $timeout = $self->_retryable_timer->timeout;
+    $timeout = 0 if $timeout == -1;
+    $self->_retryable_current_timeout($timeout);
+    $self->_retryable_call_type($call_type);
 
     # We have some post-processing to do, so save the BlockRunner object, and then save
     # the result in a context-sensitive manner.
     my $br = DBIx::Class::Storage::BlockRunner->new(
         storage       => $self,
         wrap_txn      => $call_type eq 'txn_do',
-        max_attempts  => $self->max_attempts,
+
+        # This neuters the max_attempts trigger in failed_attempt_count, so that the main check
+        # in our retry_handler works as expected.
+        max_attempts  => 99999,
+
         retry_handler => \&_blockrunner_retry_handler,
     );
 
     return preserve_context {
         $br->run($target_runner);
     }
-    after => sub { $self->_reset_counters_and_timers($br) };
+    after => sub { $self->_reset_timers_and_timeouts };
 }
 
 # Our own BlockRunner retry handler
@@ -406,54 +429,33 @@ sub _blockrunner_retry_handler {
     my $br   = shift;
     my $self = $br->storage;  # "self" for this module
 
-    my ($failed, $max, $last_error) = ($br->failed_attempt_count, $br->max_attempts, $br->last_exception);
+    my $last_error = $br->last_exception;
 
-    # If we're still connected and it's not a retryable error, stop here
-    return $self->_reset_counters_and_timers($br) if $self->connected && !$self->is_dbi_error_retryable($last_error);
+    # Record the failure in the timer algorithm (prior to any checks)
+    my ($sleep_time, $new_timeout) = $self->_retryable_timer->failure;
+
+    # If it's not a retryable error, stop here
+    my $parsed_error = $self->parse_error_class->new($last_error);
+    return $self->_reset_and_fail('Exception not transient') unless $parsed_error->is_transient;
 
     $last_error =~ s/\n.+//s;
-    warn "\nEncountered a recoverable error during attempt $failed of $max: $last_error\n\n" if $self->warn_on_retryable_error;
+    $self->_warn_retryable_error($last_error) if $self->warn_on_retryable_error;
 
-    # Figure out all of the times, timers, and timeouts
-    my $epoch = time;
+    # Either stop here (because of timeout or max attempts), sleep, or don't
+    if    ($sleep_time == -1) { return $self->_reset_and_fail('Out of retries') }
+    elsif ($sleep_time)       { sleep $sleep_time;                              }
 
-    my $this_attempt_time  = $epoch - $self->_retryable_last_attempt_time;
-    my $total_attempt_time = $epoch - $self->_retryable_first_attempt_time;
-
-    my $sleep_time = 2 ** ($failed / 2) - $this_attempt_time;
-    my $time_left  = $self->retryable_timeout ?
-        $self->retryable_timeout - $total_attempt_time :
-        86400  # infinity, basically
-    ;
-    my $max_timeout = $time_left / 2;
-    $sleep_time = min(max(0, $sleep_time), $max_timeout);  # make $sleep_time between 0 and $max_timeout
-
-    # Time's up!
-    return $self->_reset_counters_and_timers($br) if $time_left < 0;
-
-    # If the response was quick and below our attempt timer, sleep for a bit
-    if ($sleep_time > 0) {
-        sleep $sleep_time;
-        $time_left  -= $sleep_time;
-        $max_timeout = $time_left / 2;
-    }
-
-    if ($self->retryable_timeout) {
-        # Use half of the time we have left for the next timeout, but make sure it's at least
-        # five seconds
-        my $new_timeout = floor( max($max_timeout, 5) );
-        $self->_retryable_current_timeout($new_timeout);
-
+    if ($new_timeout > 0) {
         # Reset the connection timeouts before we connect again
+        $self->_retryable_current_timeout($new_timeout);
         $self->_set_dbi_connect_info;
     }
 
-    # Include reconnection costs in the next attempt time calculations
-    $self->_retryable_last_attempt_time(time);
-
-    # Force a disconnect
+    # Force a disconnect, but only if the connection seems to be in a broken state
     local $@;
-    eval { local $SIG{__DIE__}; $self->disconnect };
+    unless ($parsed_error->error_type eq 'lock') {
+        eval { local $SIG{__DIE__}; $self->disconnect };
+    }
 
     # Because BlockRunner calls this unprotected, and because our own _connect is going
     # to hit the _in_do_block short-circuit, we should call this ourselves, in a
@@ -461,36 +463,15 @@ sub _blockrunner_retry_handler {
     eval { $self->ensure_connected };
     if (my $connect_error = $@) {
         push @{ $br->exception_stack }, $connect_error;
-
-        # This will throw if max_attempts is reached
-        $br->_set_failed_attempt_count($br->failed_attempt_count + 1);
-
         return _blockrunner_retry_handler($br);
     }
 
     return 1;
 }
 
-sub _reset_counters_and_timers {
-    my ($self, $br) = @_;
-
-    $self->_retryable_first_attempt_time(0);
-    $self->_retryable_last_attempt_time(0);
-
-    # Only reset timeouts if we have to
-    if ($br->failed_attempt_count && $self->retryable_timeout) {
-        $self->_retryable_current_timeout(0);  # gets set back to R/2
-        $self->_set_dbi_connect_info;
-        $self->_set_retryable_session_timeouts;
-    }
-
-    # Useful for chaining to the return call in _blockrunner_retry_handler
-    return undef;
-}
-
 sub dbh_do {
     my $self = shift;
-    return $self->next::method(@_) if $self->disable_retryable;
+    return $self->next::method(@_) unless $self->enable_retryable;
     return $self->_blockrunner_do( dbh_do => @_ );
 }
 
@@ -512,7 +493,7 @@ Calling this method through the C<$schema> object is typically more convenient.
 
 sub txn_do {
     my $self = shift;
-    return $self->next::method(@_) if $self->disable_retryable;
+    return $self->next::method(@_) unless $self->enable_retryable;
 
     # Connects or reconnects on pid change to grab correct txn_depth (same as
     # DBIx::Class::Storage::DBI)
@@ -521,59 +502,87 @@ sub txn_do {
     $self->_blockrunner_do( txn_do => @_ );
 }
 
-=head2 is_dbi_error_retryable
+=head2 throw_exception
 
-    my $bool = $storage->is_dbi_error_retryable($dbi_err);
+    $storage->throw_exception('It failed');
 
-Returns a true value if the DBI error is the kind that should be retried by Retryable.
-These include a wide variety of timeouts, connection failures, and failover messages.
+Works just like L<DBIx::Class::Storage/throw_exception>, but also reports attempt and
+timer statistics, in case the transaction was tried multiple times.
 
 =cut
 
-sub is_dbi_error_retryable {
+sub _reset_timers_and_timeouts {
+    my $self = shift;
+
+    # Only reset timeouts if we have to, but check before we clear
+    my $needs_resetting = $self->_failed_attempt_count && $self->_retryable_current_timeout;
+
+    $self->_retryable_timer(undef);
+    $self->_reset_retryable_timeout;
+
+    if ($needs_resetting) {
+        $self->_set_dbi_connect_info;
+        $self->_set_retryable_session_timeouts;
+    }
+
+    # Useful for chaining to the return call in _blockrunner_retry_handler
+    return undef;
+}
+
+sub _warn_retryable_error {
     my ($self, $error) = @_;
 
-    # We have to capture just the first error, not other errors that may be buried in the
-    # stack trace.
-    $error =  "$error";   # don't corrupt the original error!
-    $error =~ s/\n.+//s;
+    my $timer = $self->_retryable_timer;
+    my $current_attempt_count = $self->_failed_attempt_count + 1;
+    my $debug_msg = sprintf(
+        'Retrying %s coderef, attempt %u of %u, timer: %.1f / %.1f sec, last exception: %s',
+        $self->_retryable_call_type,
+        $current_attempt_count, $self->max_attempts,
+        $timer->{_last_timestamp} - $timer->{_start_timestamp}, $timer->{max_actual_duration},
+        $error
+    );
 
-    # Disable /x flag to allow for whitespace within string, but turn it on for newlines
-    # and comments.
-    #
-    # These error messages are purposely long and case-sensitive, because we're looking
-    # for these errors -anywhere- in the string.  Best to get as exact of a match as
-    # possible.
+    warn $debug_msg;
+}
 
-    return $error =~ m<
-        # Locks
-        (?-x:Deadlock found when trying to get lock; try restarting transaction)|
-        (?-x:Lock wait timeout exceeded; try restarting transaction)|
-        (?-x:WSREP detected deadlock/conflict and aborted the transaction.\s+Try restarting the transaction)|
+sub _reset_and_fail {
+    my ($self, $fail_reason) = @_;
 
-        # Connection dropped/interrupted
-        (?-x:MySQL server has gone away)|
-        (?-x:Lost connection to MySQL server)|
-        (?-x:Query execution was interrupted)|
+    # First error: just pass the exception unaltered
+    if ($self->_failed_attempt_count <= 1) {
+        $self->_retryable_exception_prefix(undef);
+        return $self->_reset_timers_and_timeouts;
+    }
 
-        # Initial connection failure
-        (?-x:Bad handshake)|
-        (?-x:Too many connections)|
-        (?-x:Host '\S+' is blocked because of many connection errors)|
-        (?-x:Can't get hostname for your address)|
-        (?-x:Can't connect to (?:local )?MySQL server)|
+    my $timer = $self->_retryable_timer;
+    $self->_retryable_exception_prefix( sprintf(
+        'Failed %s coderef: %s, attempts: %u / %u, timer: %.1f / %.1f sec',
+        $self->_retryable_call_type, $fail_reason,
+        $self->_failed_attempt_count, $self->max_attempts,
+        $timer->{_last_timestamp} - $timer->{_start_timestamp}, $timer->{max_actual_duration},
+    ) );
 
-        # Packet corruption
-        (?-x:Got a read error from the connection pipe)|
-        (?-x:Got (?:an error|timeout) (?:reading|writing) communication packets)|
-        (?-x:Malformed communication packet)|
+    return $self->_reset_timers_and_timeouts;
+}
 
-        # Failovers
-        (?-x:WSREP has not yet prepared node for application use)|
-        (?-x:Server shutdown in progress)|
-        (?-x:Normal shutdown)|
-        (?-x:Shutdown complete)
-    >x;
+sub throw_exception {
+    my $self = shift;
+
+    # Clear the prefix as we use it
+    my $exception_prefix = $self->_retryable_exception_prefix;
+    $self->_retryable_exception_prefix(undef) if $exception_prefix;
+
+    return $self->next::method(@_) unless $exception_prefix;
+
+    my $error = shift;
+    $exception_prefix .= ', last exception: ';
+    if (blessed $error && $error->isa('DBIx::Class::Exception')) {
+        $error->{msg} = $exception_prefix.$error->{msg};
+    }
+    else {
+        $error = $exception_prefix.$error;
+    }
+    return $self->next::method($error, @_);
 }
 
 =head1 CAVEATS
@@ -622,6 +631,12 @@ C<< $storage->dbh >>.
 
 Instead, use L</dbh_do>.  This method is also used by DBIC for most of its active DB
 calls, after it has composed a proper SQL statement to run.
+
+=head1 SEE ALSO
+
+L<DBIx::Connector::Retry::MySQL> - A similar engine for DBI connections, using L<DBIx::Connector::Retry> as a base.
+
+L<DBIx::Class::Storage::BlockRunner> - Base module in DBIC that controls how transactional coderefs are ran and retried
 
 =cut
 

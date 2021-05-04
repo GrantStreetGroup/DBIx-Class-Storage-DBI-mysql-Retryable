@@ -3,10 +3,12 @@ requires 'perl', 'v5.10.0'; # for kwalitee
 
 # Direct requirements
 requires 'Context::Preserve';
+requires 'Algorithm::Backoff::RetryTimeouts';
+requires 'DBIx::ParseError::MySQL';
 requires 'namespace::clean';
 
 # Indirect (or bundled) requirements
-requires 'DBI';
+requires 'DBI', '1.630';
 requires 'DBD::mysql';
 requires 'DBIx::Class';
 
