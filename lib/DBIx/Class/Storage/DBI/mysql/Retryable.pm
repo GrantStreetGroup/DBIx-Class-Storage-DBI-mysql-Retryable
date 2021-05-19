@@ -169,7 +169,7 @@ if a process is already using some other retry logic (like L<DBIx::OnlineDDL>).
 
 Messing with this setting in the middle of a database action would not be wise.
 
-Default is (obviously) on.
+Default is on.
 
 =cut
 
