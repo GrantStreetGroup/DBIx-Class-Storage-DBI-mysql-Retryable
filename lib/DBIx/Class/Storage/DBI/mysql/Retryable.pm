@@ -502,6 +502,13 @@ sub txn_do {
     $self->_blockrunner_do( txn_do => @_ );
 }
 
+### XXX: This is a now deprecated method that only existed in the non-public version, but
+### it's a public method should still exist for anybody previously using it.
+sub is_dbi_error_retryable {
+    my ($self, $error) = @_;
+    return $self->parse_error_class->new($error)->is_transient;
+}
+
 =head2 throw_exception
 
     $storage->throw_exception('It failed');
