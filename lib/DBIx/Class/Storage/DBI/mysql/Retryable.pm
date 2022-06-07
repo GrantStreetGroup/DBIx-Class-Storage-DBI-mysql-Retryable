@@ -503,7 +503,7 @@ sub txn_do {
 }
 
 ### XXX: This is a now deprecated method that only existed in the non-public version, but
-### it's a public method should still exist for anybody previously using it.
+### it's a public method that should still exist for anybody previously using it.
 sub is_dbi_error_retryable {
     my ($self, $error) = @_;
     return $self->parse_error_class->new($error)->is_transient;
