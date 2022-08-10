@@ -300,15 +300,19 @@ subtest 'non_retryable_failure' => sub {
     local $EXEC_COUNTER    = 0;
     local $EXEC_SLEEP_TIME = 3;
     local @EXEC_ERRORS     = (
-        'MySQL server has gone away',
         "Duplicate entry '1-1' for key 'PRIMARY'",
     );
 
+    # Also test this setting
+    $storage->retries_before_error_prefix(0);
+
     run_update_test(
-        duration  => 2 * $EXEC_SLEEP_TIME,
-        attempts  => 2,
-        exception => qr<Failed dbh_do coderef: Exception not transient, attempts: 2 / 8, timer: [\d\.]+ / 0.0 sec, last exception:.+DBI Exception: DBD::mysql::st execute failed: Duplicate entry .+ for key>,
+        duration  => $EXEC_SLEEP_TIME,
+        attempts  => 1,
+        exception => qr<Failed dbh_do coderef: Exception not transient, attempts: 1 / 8, timer: [\d\.]+ / 0.0 sec, last exception:.+DBI Exception: DBD::mysql::st execute failed: Duplicate entry .+ for key>,
     );
+
+    $storage->retries_before_error_prefix(1);
 };
 
 subtest 'ran_out_of_attempts' => sub {

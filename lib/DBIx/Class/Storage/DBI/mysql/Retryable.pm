@@ -33,6 +33,7 @@ use namespace::clean;
     $storage_class->timer_class('Algorithm::Backoff::RetryTimeouts');
     $storage_class->timer_options({});           # same defaults as the timer class
     $storage_class->aggressive_timeouts(0);
+    $storage_class->retries_before_error_prefix(1);
     $storage_class->warn_on_retryable_error(0);
     $storage_class->enable_retryable(1);
 
@@ -79,6 +80,7 @@ post-connection values.
 __PACKAGE__->mk_group_accessors('inherited' => qw<
     parse_error_class timer_class
     timer_options aggressive_timeouts
+    retries_before_error_prefix
     warn_on_retryable_error enable_retryable
 >);
 
@@ -93,6 +95,7 @@ __PACKAGE__->parse_error_class('DBIx::ParseError::MySQL');
 __PACKAGE__->timer_class('Algorithm::Backoff::RetryTimeouts');
 __PACKAGE__->timer_options({});
 __PACKAGE__->aggressive_timeouts(0);
+__PACKAGE__->retries_before_error_prefix(1);
 __PACKAGE__->warn_on_retryable_error(0);
 __PACKAGE__->enable_retryable(1);
 
@@ -148,6 +151,17 @@ engine would set it to.
 
 Default is off.  Obviously, this setting only makes sense with L</retryable_timeout>
 turned on.
+
+=item retries_before_error_prefix
+
+Controls the number of retries (not tries) needed before the exception message starts
+using the statistics prefix, which looks something like this:
+
+    Failed dbh_do coderef: Out of retries, attempts: 5 / 4, timer: 34.5 / 50.0 sec
+
+The default is 1, which means a failed first attempt (like a non-transient failure) will
+show a normal exception, and the second attempt will use the prefix.  You can set this to
+0 to always show the prefix, or a large number like 99 to keep the exception clean.
 
 =head2 warn_on_retryable_error
 
@@ -576,8 +590,8 @@ sub _reset_and_fail {
     # About to throw the main exception, so set the original handler
     $SIG{__DIE__} = $self->_retryable_original_die_handler;
 
-    # First error: just pass the exception unaltered
-    if ($self->_failed_attempt_count <= 1) {
+    # First error (by default): just pass the exception unaltered
+    if ($self->_failed_attempt_count <= $self->retries_before_error_prefix) {
         $self->_retryable_exception_prefix(undef);
         return $self->_reset_timers_and_timeouts;
     }
