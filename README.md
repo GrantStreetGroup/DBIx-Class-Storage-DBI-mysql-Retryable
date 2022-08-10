@@ -4,7 +4,7 @@ DBIx::Class::Storage::DBI::mysql::Retryable - MySQL-specific DBIC storage engine
 
 # VERSION
 
-version v1.0.1
+version v1.0.2
 
 # SYNOPSIS
 
@@ -21,6 +21,7 @@ version v1.0.1
     $storage_class->timer_class('Algorithm::Backoff::RetryTimeouts');
     $storage_class->timer_options({});           # same defaults as the timer class
     $storage_class->aggressive_timeouts(0);
+    $storage_class->retries_before_error_prefix(1);
     $storage_class->warn_on_retryable_error(0);
     $storage_class->enable_retryable(1);
 
@@ -110,6 +111,17 @@ timeouts:
 
 Default is off.  Obviously, this setting only makes sense with ["retryable\_timeout"](#retryable_timeout)
 turned on.
+
+- retries\_before\_error\_prefix
+
+    Controls the number of retries (not tries) needed before the exception message starts
+    using the statistics prefix, which looks something like this:
+
+        Failed dbh_do coderef: Out of retries, attempts: 5 / 4, timer: 34.5 / 50.0 sec
+
+    The default is 1, which means a failed first attempt (like a non-transient failure) will
+    show a normal exception, and the second attempt will use the prefix.  You can set this to
+    0 to always show the prefix, or a large number like 99 to keep the exception clean.
 
 ## warn\_on\_retryable\_error
 
@@ -242,3 +254,15 @@ This software is Copyright (c) 2021 - 2022 by Grant Street Group.
 This is free software, licensed under:
 
     The Artistic License 2.0 (GPL Compatible)
+
+# POD ERRORS
+
+Hey! **The above document had some coding errors, which are explained below:**
+
+- Around line 812:
+
+    '=item' outside of any '=over'
+
+- Around line 823:
+
+    You forgot a '=back' before '=head2'
