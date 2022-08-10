@@ -85,6 +85,7 @@ __PACKAGE__->mk_group_accessors('inherited' => qw<
 __PACKAGE__->mk_group_accessors('simple' => qw<
     _retryable_timer _retryable_current_timeout
     _retryable_call_type _retryable_exception_prefix
+    _retryable_original_die_handler
 >);
 
 # Set defaults
@@ -324,6 +325,10 @@ sub _set_retryable_session_timeouts {
 
     local $@;
     eval {
+        # Again, don't want to let outside handlers ruin our error checking.  This
+        # expires before our 'die' statements below.
+        local $SIG{__DIE__};
+
         my $dbh = $self->_dbh;
         if ($dbh) {
             $dbh->do("SET SESSION $_=$timeout") for $self->_timeout_set_list('session');
@@ -418,10 +423,23 @@ sub _blockrunner_do {
         retry_handler => \&_blockrunner_retry_handler,
     );
 
+    ### XXX: Outside exception handlers shouldn't interrupt the retry process, as it might never
+    ### never return back from the eval.  This should really be a part of BlockRunner, but it's
+    ### not our module, so we hit the "local $SIG{__DIE__}" bit here.  What that means is that
+    ### we're removing the die handler a bit too high up in the process, and we have exception
+    ### throwing that should use the outside handler.
+    ###
+    ### So, we save it here, and throw it out when we're done.
+
+    $self->_retryable_original_die_handler( $SIG{__DIE__} );
+
     return preserve_context {
+        local $SIG{__DIE__};
         $br->run($target_runner);
     }
     after => sub { $self->_reset_timers_and_timeouts };
+
+    $self->_retryable_original_die_handler(undef);
 }
 
 # Our own BlockRunner retry handler
@@ -554,6 +572,9 @@ sub _warn_retryable_error {
 
 sub _reset_and_fail {
     my ($self, $fail_reason) = @_;
+
+    # About to throw the main exception, so set the original handler
+    $SIG{__DIE__} = $self->_retryable_original_die_handler;
 
     # First error: just pass the exception unaltered
     if ($self->_failed_attempt_count <= 1) {

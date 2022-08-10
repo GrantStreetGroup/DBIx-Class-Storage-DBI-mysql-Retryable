@@ -417,6 +417,54 @@ subtest 'aggressive_timeouts_on' => sub {
     $storage->aggressive_timeouts(0);
 };
 
+subtest 'outside_die_handler_doesnt_trigger_per_retry' => sub {
+    local $EXEC_COUNTER    = 0;
+    local $EXEC_SLEEP_TIME = 2;
+
+    $timer_opts->{max_actual_duration} = 20;
+
+    my $num_of_errors = 0;
+    local $SIG{__DIE__} = sub {
+        $num_of_errors++;
+        die "MyException triggered: $_[0]";
+    };
+
+    run_update_test(
+        duration => $EXEC_SUCCESS_AT * $EXEC_SLEEP_TIME + 0.8,  # ~0.82s sleep on the 4th attempt
+        attempts => $EXEC_SUCCESS_AT,
+        timeout  => 10,  # half of 20s timeout
+    );
+
+    cmp_ok $num_of_errors, '==', 0, "Outside exception handler didn't catch the DBI error";
+
+    $timer_opts->{max_actual_duration} = 0;
+};
+
+subtest 'outside_die_handler_triggers_at_final_exception' => sub {
+    local $EXEC_COUNTER    = 0;
+    local $EXEC_SUCCESS_AT = 8;
+    local $EXEC_SLEEP_TIME = 5;
+
+    $timer_opts->{max_actual_duration} = 22;
+
+    my $num_of_errors = 0;
+    local $SIG{__DIE__} = sub {
+        $num_of_errors++;
+        die "MyException triggered: $_[0]";
+    };
+
+    run_update_test(
+        duration  => 5 * $EXEC_SLEEP_TIME,
+        attempts  => 5,
+        timeout   => 11,  # half of 22s timeout
+        exception => qr<MyException triggered: Failed dbh_do coderef: Out of retries, attempts: 5 / 8, timer: [\d\.]+ / 22.0 sec, last exception:.+DBI Exception: DBD::mysql::st execute failed: WSREP has not yet prepared node for application use>,
+    );
+
+    cmp_ok $num_of_errors, '==', 1, "Outside exception handler catches only the final error";
+
+    $timer_opts->{max_actual_duration} = 0;
+};
+
 # Small test for this old method
 subtest 'is_dbi_error_retryable' => sub {
     ok  $storage->is_dbi_error_retryable('DBI Exception: DBD::mysql::db do failed: MySQL server has gone away'), "Transient error";
