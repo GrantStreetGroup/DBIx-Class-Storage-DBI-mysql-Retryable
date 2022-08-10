@@ -464,7 +464,7 @@ subtest 'outside_die_handler_triggers_at_final_exception' => sub {
         exception => qr<MyException triggered: Failed dbh_do coderef: Out of retries, attempts: 5 / 8, timer: [\d\.]+ / 22.0 sec, last exception:.+DBI Exception: DBD::mysql::st execute failed: WSREP has not yet prepared node for application use>,
     );
 
-    cmp_ok $num_of_errors, '==', 1, "Outside exception handler catches only the final error";
+    cmp_ok $num_of_errors, '==', 1, "Outside exception handler catches only the final error" if $IS_MYSQL;
 
     $timer_opts->{max_actual_duration} = 0;
 };
