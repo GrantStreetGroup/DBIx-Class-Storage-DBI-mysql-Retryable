@@ -152,7 +152,7 @@ engine would set it to.
 Default is off.  Obviously, this setting only makes sense with L</retryable_timeout>
 turned on.
 
-=item retries_before_error_prefix
+=head2 retries_before_error_prefix
 
 Controls the number of retries (not tries) needed before the exception message starts
 using the statistics prefix, which looks something like this:
