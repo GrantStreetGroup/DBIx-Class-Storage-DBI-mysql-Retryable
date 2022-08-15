@@ -33,6 +33,7 @@ use namespace::clean;
     $storage_class->timer_class('Algorithm::Backoff::RetryTimeouts');
     $storage_class->timer_options({});           # same defaults as the timer class
     $storage_class->aggressive_timeouts(0);
+    $storage_class->retries_before_error_prefix(1);
     $storage_class->warn_on_retryable_error(0);
     $storage_class->enable_retryable(1);
 
@@ -79,12 +80,14 @@ post-connection values.
 __PACKAGE__->mk_group_accessors('inherited' => qw<
     parse_error_class timer_class
     timer_options aggressive_timeouts
+    retries_before_error_prefix
     warn_on_retryable_error enable_retryable
 >);
 
 __PACKAGE__->mk_group_accessors('simple' => qw<
     _retryable_timer _retryable_current_timeout
     _retryable_call_type _retryable_exception_prefix
+    _retryable_original_die_handler
 >);
 
 # Set defaults
@@ -92,6 +95,7 @@ __PACKAGE__->parse_error_class('DBIx::ParseError::MySQL');
 __PACKAGE__->timer_class('Algorithm::Backoff::RetryTimeouts');
 __PACKAGE__->timer_options({});
 __PACKAGE__->aggressive_timeouts(0);
+__PACKAGE__->retries_before_error_prefix(1);
 __PACKAGE__->warn_on_retryable_error(0);
 __PACKAGE__->enable_retryable(1);
 
@@ -147,6 +151,17 @@ engine would set it to.
 
 Default is off.  Obviously, this setting only makes sense with L</retryable_timeout>
 turned on.
+
+=head2 retries_before_error_prefix
+
+Controls the number of retries (not tries) needed before the exception message starts
+using the statistics prefix, which looks something like this:
+
+    Failed dbh_do coderef: Out of retries, attempts: 5 / 4, timer: 34.5 / 50.0 sec
+
+The default is 1, which means a failed first attempt (like a non-transient failure) will
+show a normal exception, and the second attempt will use the prefix.  You can set this to
+0 to always show the prefix, or a large number like 99 to keep the exception clean.
 
 =head2 warn_on_retryable_error
 
@@ -324,6 +339,10 @@ sub _set_retryable_session_timeouts {
 
     local $@;
     eval {
+        # Again, don't want to let outside handlers ruin our error checking.  This
+        # expires before our 'die' statements below.
+        local $SIG{__DIE__};
+
         my $dbh = $self->_dbh;
         if ($dbh) {
             $dbh->do("SET SESSION $_=$timeout") for $self->_timeout_set_list('session');
@@ -418,10 +437,23 @@ sub _blockrunner_do {
         retry_handler => \&_blockrunner_retry_handler,
     );
 
+    ### XXX: Outside exception handlers shouldn't interrupt the retry process, as it might never
+    ### never return back from the eval.  This should really be a part of BlockRunner, but it's
+    ### not our module, so we hit the "local $SIG{__DIE__}" bit here.  What that means is that
+    ### we're removing the die handler a bit too high up in the process, and we have exception
+    ### throwing that should use the outside handler.
+    ###
+    ### So, we save it here, and throw it out when we're done.
+
+    $self->_retryable_original_die_handler( $SIG{__DIE__} );
+
     return preserve_context {
+        local $SIG{__DIE__};
         $br->run($target_runner);
     }
     after => sub { $self->_reset_timers_and_timeouts };
+
+    $self->_retryable_original_die_handler(undef);
 }
 
 # Our own BlockRunner retry handler
@@ -555,8 +587,11 @@ sub _warn_retryable_error {
 sub _reset_and_fail {
     my ($self, $fail_reason) = @_;
 
-    # First error: just pass the exception unaltered
-    if ($self->_failed_attempt_count <= 1) {
+    # About to throw the main exception, so set the original handler
+    $SIG{__DIE__} = $self->_retryable_original_die_handler;
+
+    # First error (by default): just pass the exception unaltered
+    if ($self->_failed_attempt_count <= $self->retries_before_error_prefix) {
         $self->_retryable_exception_prefix(undef);
         return $self->_reset_timers_and_timeouts;
     }
