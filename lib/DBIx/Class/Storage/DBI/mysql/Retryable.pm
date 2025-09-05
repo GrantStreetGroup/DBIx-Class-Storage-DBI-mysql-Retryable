@@ -443,11 +443,15 @@ sub _blockrunner_do {
     ### we're removing the die handler a bit too high up in the process, and we have exception
     ### throwing that should use the outside handler.
     ###
+    ### Also, BlockRunner doesn't always protect its $@ result from DBI evals, so we also need to
+    ### protect that here.
+    ###
     ### So, we save it here, and throw it out when we're done.
 
     $self->_retryable_original_die_handler( $SIG{__DIE__} );
 
     return preserve_context {
+        local $@;
         local $SIG{__DIE__};
         $br->run($target_runner);
     }
