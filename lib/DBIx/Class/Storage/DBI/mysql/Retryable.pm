@@ -186,6 +186,8 @@ Messing with this setting in the middle of a database action would not be wise.
 
 Default is on.
 
+=for Pod::Coverage max_attempts retryable_timeout disable_retryable
+
 =cut
 
 ### Backward-compatibility for legacy attributes
@@ -537,6 +539,10 @@ sub txn_do {
 
     $self->_blockrunner_do( txn_do => @_ );
 }
+
+=for Pod::Coverage is_dbi_error_retryable
+
+=cut
 
 ### XXX: This is a now deprecated method that only existed in the non-public version, but
 ### it's a public method that should still exist for anybody previously using it.
